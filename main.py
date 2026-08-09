@@ -1708,6 +1708,7 @@ def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, str]
         icon = QUESTION_ICON
     else:
         icon = f"https://api.nlib.cc/nx/{normalized or 'FFFFFFFFFFFFFFFF'}/icon/128/128"
+        # 备用图库 icon = f"https://tinfoil.media/ti/{normalized or 'FFFFFFFFFFFFFFFF'}/128/128"
 
     return {
         "name": game_name,
