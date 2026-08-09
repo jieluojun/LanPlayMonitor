@@ -1486,11 +1486,34 @@ def start_remote_download_thread():
 # SECTION 5 · 标题映射加载
 # ============================================================================
 
+# 标题映射加载结果缓存：避免每秒轮询 refresh_config 时重复刷日志
+_game_titles_cache: dict[str, str] | None = None
+_game_titles_mtime: float | None = None
+_game_titles_logged_sig: str = ""
+
+
 def load_game_titles() -> dict[str, str]:
-    merged = dict(BUILTIN_GAME_TITLES)
+    """加载标题映射；仅在文件变更或首次加载时写日志，避免跟随轮询重复叠加。"""
+    global _game_titles_cache, _game_titles_mtime, _game_titles_logged_sig
     local_path = Path(LOCAL_CHINESE_DB_FILE)
+    mtime: float | None = None
+    try:
+        if local_path.is_file():
+            mtime = local_path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    if _game_titles_cache is not None and mtime == _game_titles_mtime:
+        return dict(_game_titles_cache)
+
+    merged = dict(BUILTIN_GAME_TITLES)
     if not local_path.is_file():
-        info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
+        sig = f"builtin:{len(merged)}"
+        if sig != _game_titles_logged_sig:
+            info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
+            _game_titles_logged_sig = sig
+        _game_titles_cache = dict(merged)
+        _game_titles_mtime = mtime
         return merged
     try:
         with open(local_path, "r", encoding="utf-8-sig") as f:
@@ -1499,12 +1522,22 @@ def load_game_titles() -> dict[str, str]:
             for k, v in data.items():
                 if k and v:
                     merged[str(k).upper()] = str(v)
-            info(f"[配置] 标题映射已加载: {len(data)} 条，合并后总数: {len(merged)}")
+            sig = f"file:{len(data)}:{len(merged)}"
+            if sig != _game_titles_logged_sig:
+                info(f"[配置] 标题映射已加载: {len(data)} 条，合并后总数: {len(merged)}")
+                _game_titles_logged_sig = sig
+            _game_titles_cache = dict(merged)
+            _game_titles_mtime = mtime
             return merged
         warn("[配置警告] 本地标题映射格式不正确")
     except Exception as exc:
         warn(f"[配置警告] 读取本地标题映射失败（{exc}）")
-    info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
+    sig = f"builtin-fallback:{len(merged)}"
+    if sig != _game_titles_logged_sig:
+        info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
+        _game_titles_logged_sig = sig
+    _game_titles_cache = dict(merged)
+    _game_titles_mtime = mtime
     return merged
 
 # ============================================================================
@@ -1674,7 +1707,7 @@ def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, str]
     if is_unknown:
         icon = QUESTION_ICON
     else:
-        icon = f"https://tinfoil.media/ti/{normalized or 'FFFFFFFFFFFFFFFF'}/48/48"
+        icon = f"https://api.nlib.cc/nx/{normalized or 'FFFFFFFFFFFFFFFF'}/icon/128/128"
 
     return {
         "name": game_name,
@@ -2189,7 +2222,13 @@ def _load_servers_from_file(file_path: str) -> list[dict[str, Any]]:
     return servers
 
 
+# 服务器列表加载签名：仅在内容变化时写日志，避免跟随轮询重复叠加
+_servers_load_logged_sig: str = ""
+_servers_missing_local_logged: bool = False
+
+
 def _load_servers_merged() -> list[dict[str, Any]]:
+    global _servers_load_logged_sig, _servers_missing_local_logged
     merged: dict[str, dict[str, Any]] = {}
     builtin_ids: set[str] = set()
     remote_ids: set[str] = set()
@@ -2203,13 +2242,18 @@ def _load_servers_merged() -> list[dict[str, Any]]:
                 srv.setdefault("is_remote", True)
                 merged[srv["id"]] = srv
                 remote_ids.add(srv["id"])
+            _servers_missing_local_logged = False
         else:
-            info("[配置警告] 本地服务器列表为空，使用内置兜底")
+            if not _servers_missing_local_logged:
+                info("[配置警告] 本地服务器列表为空，使用内置兜底")
+                _servers_missing_local_logged = True
             local_exists = False
 
     use_builtin = not local_exists
     if use_builtin:
-        info("[配置] 本地服务器列表不存在，使用内置兜底")
+        if not _servers_missing_local_logged:
+            info("[配置] 本地服务器列表不存在，使用内置兜底")
+            _servers_missing_local_logged = True
         for item in DEFAULT_SERVERS:
             try:
                 srv = validate_server(item)
@@ -2246,7 +2290,11 @@ def _load_servers_merged() -> list[dict[str, Any]]:
     builtin_count = sum(1 for s in merged.values() if s.get("is_builtin"))
     remote_count = sum(1 for s in merged.values() if s.get("is_remote"))
     manual_count = sum(1 for s in merged.values() if s.get("is_manual"))
-    info(f"[配置] 服务器列表加载完成，共 {total} 台（内置 {builtin_count}，远程 {remote_count}，自定义 {manual_count}）")
+    # 仅在服务器列表实际变化时打日志，避免每秒轮询 refresh_config 重复叠加
+    sig = f"{total}:{builtin_count}:{remote_count}:{manual_count}:" + ",".join(sorted(merged.keys()))
+    if sig != _servers_load_logged_sig:
+        info(f"[配置] 服务器列表加载完成，共 {total} 台（内置 {builtin_count}，远程 {remote_count}，自定义 {manual_count}）")
+        _servers_load_logged_sig = sig
     return list(merged.values())
 
 # ============================================================================

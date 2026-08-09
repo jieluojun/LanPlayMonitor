@@ -387,7 +387,8 @@ html.dark .brand-area > button.nav-drag-over,
   border-color:var(--cyan)!important;
   box-shadow:inset 0 0 0 1px rgba(46,230,200,.25);
 }
-.brand-area.nav-reordering{
+.brand-area.nav-reordering,
+.brand-area.nav-holding{
   touch-action:none;
   overflow-x:auto;
   overflow-y:visible;
@@ -931,24 +932,21 @@ html.dark .server-group.dragging {
   transform: translateX(-160px);
 }
 
-/* ===== 地区 / 类型标签：左侧与名称、地址上下对齐 ===== */
-.card-region {
-  display: block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--green);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .3px;
-  line-height: 1.35;
+/* ===== 地区 / 类型标签：同一列左缘对齐（与名称、地址上下齐） ===== */
+.server-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
   margin: 1px 0 0;
+  max-width: 100%;
+  min-width: 0;
   pointer-events: none;
 }
-
+.card-region,
 .server-type-badge {
-  display: inline-block;
+  display: block;
+  box-sizing: border-box;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -958,8 +956,14 @@ html.dark .server-group.dragging {
   font-weight: 700;
   letter-spacing: .3px;
   line-height: 1.35;
-  margin: 1px 0 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
   pointer-events: none;
+}
+.card-region {
+  color: var(--green);
 }
 .server-type-badge.builtin {
   color: var(--orange);
@@ -3268,18 +3272,25 @@ html:not(.dark) {
   line-height: 1.35 !important;
   max-width: 100% !important;
 }
-.card-region {
+.server-tags {
+  gap: calc(1px * var(--dpi, 1)) !important;
+  margin: calc(1px * var(--dpi, 1)) 0 0 !important;
+  max-width: 100% !important;
+}
+.card-region,
+.server-type-badge {
   font-size: calc(10px * var(--dpi, 1)) !important;
   line-height: 1.35 !important;
   max-width: 100% !important;
   overflow: hidden !important;
   text-overflow: ellipsis !important;
   white-space: nowrap !important;
-}
-.server-type-badge {
-  font-size: calc(10px * var(--dpi, 1)) !important;
-  padding: calc(1px * var(--dpi, 1)) calc(5px * var(--dpi, 1)) !important;
-  border-radius: calc(4px * var(--dpi, 1)) !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  display: block !important;
 }
 
 /* 头部右侧 4 项指标 */
@@ -3547,6 +3558,74 @@ html:not(.dark) {
 }
 `;
     document.head.appendChild(__styleEl);
+
+    // === PATCH: 房间布局 - 图标跨两行，meta 与游戏名左对齐并微右移 ===
+    (function(){
+      const __roomPatch = document.createElement('style');
+      __roomPatch.id = 'lanplay-room-patch';
+      __roomPatch.textContent = `
+/* --- Patch: 游戏图标扩到第二行，第二行与游戏名对齐并往右微移 --- */
+.room-item{
+  display: grid !important;
+  grid-template-columns: calc(40px * var(--dpi, 1)) 1fr !important;
+  column-gap: calc(10px * var(--dpi, 1)) !important;
+  row-gap: 0 !important;
+  align-items: start !important;
+}
+.room-item .room-top,
+.room-item .room-game-left{
+  display: contents !important;
+}
+.room-item .room-icon{
+  grid-column: 1 !important;
+  grid-row: 1 / span 2 !important;
+  width: calc(40px * var(--dpi, 1)) !important;
+  height: calc(40px * var(--dpi, 1)) !important;
+  border-radius: calc(8px * var(--dpi, 1)) !important;
+  align-self: start !important;
+  margin: 0 !important;
+  object-fit: cover !important;
+  flex-shrink: 0 !important;
+  cursor: zoom-in !important;
+  transition: transform .15s ease, filter .15s ease !important;
+}
+.room-item .room-icon:hover{
+  transform: scale(1.04) !important;
+  filter: brightness(1.05) !important;
+}
+.room-item .room-icon:active{
+  transform: scale(0.98) !important;
+}
+.room-item span.room-icon{
+  display: grid !important;
+  place-items: center !important;
+  line-height: 1 !important;
+  font-size: calc(16px * var(--dpi, 1)) !important;
+}
+.room-item .game-name{
+  grid-column: 2 !important;
+  grid-row: 1 !important;
+  align-self: center !important;
+  justify-self: start !important;
+  margin: 0 !important;
+}
+.room-item .room-meta{
+  grid-column: 2 !important;
+  grid-row: 2 !important;
+  margin-top: calc(6px * var(--dpi, 1)) !important;
+  margin-left: calc(2px * var(--dpi, 1)) !important;
+  padding-left: 0 !important;
+  align-self: center !important;
+  justify-content: flex-start !important;
+}
+.room-item .room-players{
+  grid-column: 1 / -1 !important;
+  margin-top: calc(10px * var(--dpi, 1)) !important;
+}
+.room-top{ gap: 0 !important; }
+`;
+      document.head.appendChild(__roomPatch);
+    })();
 
     // ---------- 注入页面结构（原 index.html 的 <body> 内容） ----------
     document.body.innerHTML = `
@@ -4683,6 +4762,11 @@ html:not(.dark) {
       return (btn && area.contains(btn)) ? btn : null;
     }
 
+    function restoreAreaTouchAction() {
+      try { area.style.touchAction = ''; } catch (_) { /* ignore */ }
+      area.classList.remove('nav-holding');
+    }
+
     function onPointerDown(e) {
       if (e.button != null && e.button !== 0) return;
       const btn = e.target.closest('#brandArea > button');
@@ -4695,6 +4779,9 @@ html:not(.dark) {
       dragging = false;
       dragEl = null;
       clearTimer();
+      // 按下即禁用原生 pan-x，长按后可直接左右拖排序
+      try { area.style.touchAction = 'none'; } catch (_) { /* ignore */ }
+      area.classList.add('nav-holding');
       longPressTimer = setTimeout(() => {
         dragging = true;
         dragEl = btn;
@@ -4707,7 +4794,7 @@ html:not(.dark) {
           }
         } catch (_) { /* ignore */ }
         try { if (navigator.vibrate) navigator.vibrate(12); } catch (_) { /* ignore */ }
-      }, 420);
+      }, 380);
     }
 
     function onPointerMove(e) {
@@ -4718,7 +4805,10 @@ html:not(.dark) {
         if (longPressTimer) {
           const dx = e.clientX - startX;
           const dy = e.clientY - startY;
-          if (dx * dx + dy * dy > 64) clearTimer();
+          if (dx * dx + dy * dy > 400) { // ~20px
+            clearTimer();
+            restoreAreaTouchAction();
+          }
         }
         return;
       }
@@ -4737,6 +4827,7 @@ html:not(.dark) {
         dragEl = null;
         activePointerId = null;
         endDragVisual();
+        restoreAreaTouchAction();
         return;
       }
       e.preventDefault();
@@ -4760,6 +4851,7 @@ html:not(.dark) {
       dragging = false;
       dragEl = null;
       activePointerId = null;
+      restoreAreaTouchAction();
     }
 
     function onPointerCancel(e) {
@@ -4769,6 +4861,7 @@ html:not(.dark) {
       dragging = false;
       dragEl = null;
       activePointerId = null;
+      restoreAreaTouchAction();
     }
 
     area.addEventListener('pointerdown', onPointerDown);
@@ -5110,9 +5203,9 @@ html:not(.dark) {
 
     let iconHtml;
     if (contentId === UNKNOWN_ID) {
-      iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;" title="${esc(room.game)}">?</span>`;
+      iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;cursor:default;" title="${esc(room.game)}">?</span>`;
     } else {
-      iconHtml = `<img src="${finalIcon}" alt="${esc(room.game)}" title="${esc(room.game)}" class="room-icon" loading="lazy" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
+      iconHtml = `<img src="${finalIcon}" alt="${esc(room.game)}" title="点击放大查看 - ${esc(room.game)}" class="room-icon" loading="lazy" data-full="${esc(finalIcon)}" draggable="false" style="cursor:zoom-in;" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
     }
 
     const gameDisplay = gameVal;
@@ -5438,6 +5531,12 @@ html:not(.dark) {
     return `<span class="server-type-badge ${cls}">${type}</span>`;
   }
 
+  // 地区 + 内置/远程/自定义 放进同一列容器，保证左缘对齐
+  function buildServerTagsHtml(regionHtml, typeBadgeHtml) {
+    if (!regionHtml && !typeBadgeHtml) return '';
+    return `<div class="server-tags">${regionHtml || ''}${typeBadgeHtml || ''}</div>`;
+  }
+
   // ===== 筛选应用 =====
   function applyFilter(autoExpand) {
     if (autoExpand === undefined) autoExpand = false;
@@ -5533,6 +5632,13 @@ html:not(.dark) {
   let draggedEl = null;
   function initDragAndDrop(div, s) {
     div.setAttribute('draggable', 'true');
+    // 记录按下位置，供 dragstart 计算拖影相对卡片的偏移，使拖影与卡片对齐
+    div.addEventListener('pointerdown', e => {
+      if (e.button != null && e.button !== 0) return;
+      const rect = div.getBoundingClientRect();
+      div._dragOffsetX = e.clientX - rect.left;
+      div._dragOffsetY = e.clientY - rect.top;
+    }, { passive: true });
     div.addEventListener('dragstart', e => {
       // 聊天消息内（尤其是图片）长按不能启动服务器卡片拖拽，否则卡片会停留在 opacity:.4 的灰色状态。
       const target = e.target;
@@ -5544,8 +5650,17 @@ html:not(.dark) {
         return;
       }
       draggedEl = div;
-      div.classList.add('dragging');
-      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try {
+          const ox = Number.isFinite(div._dragOffsetX) ? div._dragOffsetX : (div.offsetWidth / 2);
+          const oy = Number.isFinite(div._dragOffsetY) ? div._dragOffsetY : 24;
+          e.dataTransfer.setDragImage(div, ox, oy);
+        } catch (_) { /* 旧 WebView 可能不支持 setDragImage */ }
+      }
+      requestAnimationFrame(() => {
+        if (draggedEl === div) div.classList.add('dragging');
+      });
     });
     div.addEventListener('dragend', () => {
       div.classList.remove('dragging');
@@ -6627,7 +6742,37 @@ html:not(.dark) {
 
   // 公共聊天图标、在线成员图标、服务器聊天输入框共用的资料门禁。
   // 配置成功后再启动聊天连接；页面首次进入时不会调用本函数。
-  function requireUsernameForChat(callback) {
+  // 进入前必须先配置 GoEasy（appkey + host），否则引导打开环境变量设置。
+  let _pendingChatAfterEnv = null;
+
+  function isGoEasyConfigured() {
+    try {
+      const ak = (state.goEasyConfig && state.goEasyConfig.appkey)
+        ? String(state.goEasyConfig.appkey).trim() : '';
+      const host = (state.goEasyConfig && state.goEasyConfig.host)
+        ? String(state.goEasyConfig.host).trim() : '';
+      return !!(ak && host);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function openEnvSettingsFromChatGate() {
+    try {
+      const btn = document.getElementById('envSettingsBtn');
+      if (btn) {
+        btn.click();
+        return;
+      }
+    } catch (e) {}
+    // 兜底：直接打开模态框（无安全流程时）
+    try {
+      const modal = document.getElementById('envSettingsModal');
+      if (modal) modal.classList.add('open');
+    } catch (e2) {}
+  }
+
+  function proceedAfterUsernameForChat(callback) {
     return ensureUsername(function () {
       updateChatUI();
       ensureGoEasySdk(function () {
@@ -6635,6 +6780,43 @@ html:not(.dark) {
       });
       if (typeof callback === 'function') callback();
     });
+  }
+
+  function requireUsernameForChat(callback) {
+    function continueChatGate() {
+      if (!isGoEasyConfigured()) {
+        showToast('⚠️ 请先配置 GoEasy 环境变量（AppKey 和主机）后再设置用户名', 3500, false);
+        _pendingChatAfterEnv = function () {
+          _pendingChatAfterEnv = null;
+          proceedAfterUsernameForChat(callback);
+        };
+        openEnvSettingsFromChatGate();
+        return false;
+      }
+      _pendingChatAfterEnv = null;
+      return proceedAfterUsernameForChat(callback);
+    }
+
+    // 若本地尚未拿到 runtime 配置，先补拉一次再判断
+    if (!isGoEasyConfigured()) {
+      getJSON('/api/env/runtime?_=' + Date.now()).then(function (d) {
+        try {
+          if (d && d.ok === true && d.config && typeof d.config === 'object') {
+            if (d.config.goeasy && typeof d.config.goeasy === 'object') {
+              state.goEasyConfig = d.config.goeasy;
+            }
+            if (d.config.cloudflare_r2 && typeof d.config.cloudflare_r2 === 'object') {
+              state.r2Config = d.config.cloudflare_r2;
+            }
+          }
+        } catch (e) {}
+        continueChatGate();
+      }).catch(function () {
+        continueChatGate();
+      });
+      return false;
+    }
+    return continueChatGate();
   }
 
   function updateChatUI() {
@@ -7106,8 +7288,29 @@ html:not(.dark) {
     return _builtInDownload(url, originalName, true, mimeType || 'application/octet-stream');
   }
 
+  function isR2UploadConfigured() {
+    const mb = Number(state.r2Config && state.r2Config.max_upload_mb);
+    return Number.isFinite(mb) && mb > 0;
+  }
+  function requireR2ForUpload(actionLabel) {
+    if (isR2UploadConfigured()) return true;
+    const label = actionLabel || '上传';
+    showToast('❌ 请先在环境变量中配置存储桶（含 max_upload_mb）后再' + label, 3200, false);
+    try {
+      const btn = document.getElementById('envSettingsBtn');
+      if (btn && typeof btn.click === 'function') {
+        setTimeout(function () { try { btn.click(); } catch (_) {} }, 400);
+      }
+    } catch (_) {}
+    return false;
+  }
+
   function uploadFile(file) {
     if (!file) return Promise.resolve(null);
+    if (!isR2UploadConfigured()) {
+      requireR2ForUpload('上传');
+      return Promise.resolve(null);
+    }
     return new Promise((resolve) => {
       const formData = new FormData();
       // 如果文件后缀被 R2 屏蔽下载，XOR 加密文件内容让 R2 无法识别格式
@@ -7249,6 +7452,7 @@ html:not(.dark) {
   }
 
   function sendMessageWithMedia(serverId, inputElement, sendFunction, isPublic, accept) {
+    if (!requireR2ForUpload('上传文件')) return;
     const fileInput = document.createElement('input');
     fileInput.type = 'file';
     fileInput.accept = accept || 'image/*,video/*,audio/*,*/*';
@@ -7259,7 +7463,7 @@ html:not(.dark) {
       // 上传上限只读取环境配置，不再使用前端内置的 R2 数值。
       const maxUploadMb = Number(state.r2Config && state.r2Config.max_upload_mb) || 0;
       if (maxUploadMb <= 0) {
-        showToast('❌ R2 未配置，请先填写存储桶配置和单文件上限', 3000, false);
+        requireR2ForUpload('上传文件');
         return;
       }
       const maxUploadBytes = maxUploadMb * 1024 * 1024;
@@ -7490,6 +7694,11 @@ html:not(.dark) {
   }
 
   async function startVoiceRecording(btn, onBlob) {
+    if (_voiceRecordState.recorder && _voiceRecordState.recorder.state === 'recording') {
+      finishVoiceRecording(onBlob);
+      return;
+    }
+    if (!requireR2ForUpload('录音')) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       showToast('❌ 当前环境不支持录音', 2500, false);
       return;
@@ -7497,11 +7706,6 @@ html:not(.dark) {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) {
       showToast('❌ 当前环境不支持 WAV 录音', 3000, false);
-      return;
-    }
-    // 已在录制：再次点击 → 停止并发送 WAV
-    if (_voiceRecordState.recorder && _voiceRecordState.recorder.state === 'recording') {
-      finishVoiceRecording(onBlob);
       return;
     }
     cancelVoiceRecording();
@@ -10695,40 +10899,56 @@ html:not(.dark) {
         }
 
         const infoEl = group.querySelector('.server-info');
-        const regionEl = group.querySelector('.card-region');
-        if (regionEl) {
-          if (!s.region) { regionEl.remove(); }
-          else if (regionEl.textContent !== s.region) { regionEl.textContent = s.region; regionEl.title = s.region; }
-        } else if (s.region && infoEl) {
-          // 插在地址后面
-          const addr = infoEl.querySelector('.server-address');
-          if (addr && addr.nextSibling) infoEl.insertBefore(createElementFromHTML(regionHtml), addr.nextSibling);
-          else if (addr) infoEl.appendChild(createElementFromHTML(regionHtml));
-          else infoEl.insertAdjacentHTML('beforeend', regionHtml);
-        }
-
-        let typeEl = group.querySelector('.server-type-badge');
-        if (typeBadgeHtml) {
-          if (!typeEl && infoEl) {
-            // 放在地区之后 / 地址之后
-            const regionNow = infoEl.querySelector('.card-region');
-            const addr = infoEl.querySelector('.server-address');
-            const anchor = regionNow || addr;
-            if (anchor && anchor.nextSibling) infoEl.insertBefore(createElementFromHTML(typeBadgeHtml), anchor.nextSibling);
-            else if (anchor) infoEl.appendChild(createElementFromHTML(typeBadgeHtml));
-            else infoEl.insertAdjacentHTML('beforeend', typeBadgeHtml);
-            typeEl = group.querySelector('.server-type-badge');
-          } else if (typeEl) {
+        // 统一维护 server-tags 容器，保证地区与类型标签左缘对齐
+        if (infoEl) {
+          let tagsEl = infoEl.querySelector('.server-tags');
+          const needTags = !!(regionHtml || typeBadgeHtml);
+          if (!needTags) {
+            if (tagsEl) tagsEl.remove();
+            // 兼容旧 DOM：散落的标签一并清掉
+            infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => el.remove());
+          } else {
+            if (!tagsEl) {
+              tagsEl = document.createElement('div');
+              tagsEl.className = 'server-tags';
+              const addr = infoEl.querySelector('.server-address');
+              if (addr && addr.nextSibling) infoEl.insertBefore(tagsEl, addr.nextSibling);
+              else if (addr) infoEl.appendChild(tagsEl);
+              else infoEl.appendChild(tagsEl);
+            }
+            // 迁移旧版散落在 info 下的标签进容器
+            infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => {
+              tagsEl.appendChild(el);
+            });
+            let regionEl = tagsEl.querySelector('.card-region');
+            if (s.region) {
+              if (!regionEl) {
+                regionEl = document.createElement('span');
+                regionEl.className = 'card-region';
+                tagsEl.insertBefore(regionEl, tagsEl.firstChild);
+              }
+              if (regionEl.textContent !== s.region) {
+                regionEl.textContent = s.region;
+                regionEl.title = s.region;
+              }
+            } else if (regionEl) {
+              regionEl.remove();
+            }
+            let typeEl = tagsEl.querySelector('.server-type-badge');
             const newType = s.is_builtin ? '内置' : s.is_remote ? '远程' : s.is_manual ? '自定义' : '';
+            const newCls = s.is_builtin ? 'builtin' : s.is_remote ? 'remote' : s.is_manual ? 'manual' : '';
             if (newType) {
+              if (!typeEl) {
+                typeEl = document.createElement('span');
+                tagsEl.appendChild(typeEl);
+              }
               typeEl.textContent = newType;
-              typeEl.className = 'server-type-badge ' + (s.is_builtin ? 'builtin' : s.is_remote ? 'remote' : 'manual');
-            } else {
+              typeEl.className = 'server-type-badge ' + newCls;
+            } else if (typeEl) {
               typeEl.remove();
             }
+            if (!tagsEl.childElementCount) tagsEl.remove();
           }
-        } else {
-          if (typeEl) typeEl.remove();
         }
 
         const statBs = group.querySelectorAll('.stat-item b');
@@ -10810,8 +11030,7 @@ html:not(.dark) {
               <div class="server-info">
                 ${nameHtml}
                 ${addrHtml}
-                ${regionHtml}
-                ${typeBadgeHtml}
+                ${buildServerTagsHtml(regionHtml, typeBadgeHtml)}
                 <div class="server-detail"></div>
               </div>
               <span class="unread-indicator" data-server-id="${s.id}" style="display: ${indicatorStyle};">${indicatorText}</span>
@@ -10889,6 +11108,38 @@ html:not(.dark) {
       if (contentId && contentId !== UNKNOWN_ID) {
         copyWithMessage(contentId, '✅ 已复制游戏 ID: ' + contentId);
       }
+    }
+  });
+
+  // ===== 点击游戏图标放大查看（复用聊天图片预览） =====
+  document.addEventListener('click', function (e) {
+    const icon = e.target.closest('.room-icon');
+    if (!icon) return;
+    if (icon.tagName.toLowerCase() !== 'img') return;
+    const rawSrc = icon.dataset.full || icon.getAttribute('src') || icon.src || '';
+    if (!rawSrc || rawSrc === QUESTION_ICON_DATA || rawSrc.indexOf('data:image') === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    let hiRes = rawSrc;
+    try {
+      if (hiRes.indexOf('/icon/128/128') !== -1) hiRes = hiRes.replace('/icon/128/128', '/icon/256/256');
+      else if (hiRes.indexOf('/icon/128') !== -1) hiRes = hiRes.replace('/icon/128', '/icon/256');
+    } catch (_) {}
+    if (typeof openImageLightbox === 'function') {
+      openImageLightbox(hiRes);
+      // 若高分辨率图不存在，回退到原图
+      setTimeout(function () {
+        try {
+          const s = document.querySelector('#chatImageLightbox .chat-lightbox-img');
+          if (s && s.getAttribute('src') === hiRes) {
+            s.onerror = function () { this.onerror = null; this.src = rawSrc; };
+            // 触发一次错误检测：用 Image 预检
+            const probar = new Image();
+            probar.onerror = function () { try { s.src = rawSrc; } catch (e) {} };
+            probar.src = hiRes;
+          }
+        } catch (e2) {}
+      }, 180);
     }
   });
 
@@ -11551,6 +11802,17 @@ html:not(.dark) {
         showToast('✅ 环境变量配置已保存并应用', 2200, true);
         // 保存成功后自动关闭环境变量配置弹窗；失败时保留弹窗以便修正。
         close();
+        // 若因聊天/用户名门禁而打开本页，GoEasy 配好后自动继续设置用户名与连接
+        try {
+          if (typeof isGoEasyConfigured === 'function' && isGoEasyConfigured()
+              && typeof _pendingChatAfterEnv === 'function') {
+            const pending = _pendingChatAfterEnv;
+            _pendingChatAfterEnv = null;
+            setTimeout(function () {
+              try { pending(); } catch (e) { console.warn('[env] 继续聊天门禁失败', e); }
+            }, 200);
+          }
+        } catch (e) {}
       } catch (e) {
         showToast('❌ 保存失败：' + (e && e.message ? e.message : e), 3000, false);
       } finally {
