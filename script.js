@@ -3566,11 +3566,14 @@ html:not(.dark) {
       __roomPatch.textContent = `
 /* --- Patch: 游戏图标扩到第二行，第二行与游戏名对齐并往右微移 --- */
 .room-item{
-  display: grid !important;
+  display: grid;
   grid-template-columns: calc(40px * var(--dpi, 1)) 1fr !important;
   column-gap: calc(10px * var(--dpi, 1)) !important;
   row-gap: 0 !important;
   align-items: start !important;
+}
+.room-item[style*="display: none"]{
+  display: none !important;
 }
 .room-item .room-top,
 .room-item .room-game-left{
