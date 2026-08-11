@@ -5693,7 +5693,7 @@ html:not(.dark) {
     lastY: 0,
     // 边缘热区高度（px）与基础滚动速度（px/帧）
     edge: 200,
-    maxSpeed: 1400
+    maxSpeed: 900
   };
 
   function _stopCardDragAutoScroll() {
