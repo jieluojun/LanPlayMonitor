@@ -11311,61 +11311,76 @@ function renderServers() {
     return normalizeFilterGame(room.game) === gameKey;
   }
 
-  function renderFilters() {
-    const games = getActiveFilterGames().slice(0, 10);
-    // 固定：全部 / 总房间；游戏标签随保活房间存在而显示
-    const tabs = ['all_servers', 'all', ...games];
-    const container = document.getElementById('filters');
-    if (!container) return;
-    const existing = container.children;
+/**
+ * 渲染筛选标签
+ * 每个标签显示对应的房间数：全部(服务器数) / 总房间(房间数) / 游戏名(房间数)
+ */
+function renderFilters() {
+  const games = getActiveFilterGames().slice(0, 10);
+  // 固定：全部 / 总房间；游戏标签随保活房间存在而显示
+  const tabs = ['all_servers', 'all', ...games];
+  const container = document.getElementById('filters');
+  if (!container) return;
+  const existing = container.children;
 
-    while (existing.length < tabs.length) {
-      const btn = document.createElement('button');
-      btn.className = 'filter-tab';
-      btn.addEventListener('click', () => {
-        container.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        state.game = btn.dataset.game;
+  while (existing.length < tabs.length) {
+    const btn = document.createElement('button');
+    btn.className = 'filter-tab';
+    btn.addEventListener('click', () => {
+      container.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.game = btn.dataset.game;
 
-        let autoExpand = true;
-        if (btn.dataset.game === 'all') {
-          autoExpand = false;
-        } else if (btn.dataset.game === 'all_servers') {
-          autoExpand = true;
-        } else {
-          autoExpand = true;
-        }
-        applyFilter(autoExpand);
-      });
-      container.appendChild(btn);
-    }
-
-    while (existing.length > tabs.length) {
-      existing[existing.length - 1].remove();
-    }
-
-    // 当前选中的游戏已无保活房间 → 回退到「总房间」
-    const activeGames = new Set(games);
-    if (state.game !== 'all' && state.game !== 'all_servers' &&
-        !activeGames.has(normalizeFilterGame(state.game))) {
-      state.game = 'all';
-    }
-
-    tabs.forEach((g, i) => {
-      const btn = existing[i];
-      let label;
-      if (g === 'all') label = `总房间 (${state.rooms.length})`;
-      else if (g === 'all_servers') label = `全部 (${state.servers.length})`;
-      else label = esc(g);
-      btn.dataset.game = g;
-      btn.textContent = label;
-
-      const active = (g === 'all' && state.game === 'all') ||
-        (g === 'all_servers' && state.game === 'all_servers') ||
-        (g !== 'all' && g !== 'all_servers' && state.game === g);
-      btn.classList.toggle('active', active);
+      let autoExpand = true;
+      if (btn.dataset.game === 'all') {
+        autoExpand = false;
+      } else if (btn.dataset.game === 'all_servers') {
+        autoExpand = true;
+      } else {
+        autoExpand = true;
+      }
+      applyFilter(autoExpand);
     });
+    container.appendChild(btn);
   }
+
+  while (existing.length > tabs.length) {
+    existing[existing.length - 1].remove();
+  }
+
+  // 当前选中的游戏已无保活房间 → 回退到「总房间」
+  const activeGames = new Set(games);
+  if (state.game !== 'all' && state.game !== 'all_servers' &&
+      !activeGames.has(normalizeFilterGame(state.game))) {
+    state.game = 'all';
+  }
+
+  tabs.forEach((g, i) => {
+    const btn = existing[i];
+    let label;
+    let count = 0;
+    if (g === 'all') {
+      // 总房间：显示保活房间总数
+      count = state.rooms.length;
+      label = `总房间 (${count})`;
+    } else if (g === 'all_servers') {
+      // 全部：显示服务器总数
+      count = state.servers.length;
+      label = `全部 (${count})`;
+    } else {
+      // 游戏标签：显示该游戏的保活房间数（包括未知游戏）
+      count = state.rooms.filter(r => normalizeFilterGame(r.game) === g).length;
+      label = `${esc(g)} (${count})`;
+    }
+    btn.dataset.game = g;
+    btn.textContent = label;
+
+    const active = (g === 'all' && state.game === 'all') ||
+      (g === 'all_servers' && state.game === 'all_servers') ||
+      (g !== 'all' && g !== 'all_servers' && state.game === g);
+    btn.classList.toggle('active', active);
+  });
+}
 
   // 正在该服务器卡片内聊天（输入框聚焦）时，自动展开逻辑不得收起该卡片
   function isServerChatActive(serverId) {
