@@ -5579,23 +5579,36 @@ html:not(.dark) {
         if (isServerChatActive(state.servers[i].id)) { chattingNow = true; break; }
       }
     }
-    const effectiveAutoExpand = autoExpand && state.autoExpand && !chattingNow;
+    // 用户主动点击游戏标题筛选时始终允许自动展开匹配卡片（不受「自动展开」开关限制）
+    // 仅轮询刷新时的 applyFilter(false) 才完全跟随 state.autoExpand
+    const userPickedGame = autoExpand === true && state.game !== 'all' && state.game !== 'all_servers';
+    const effectiveAutoExpand = (autoExpand && !chattingNow && (state.autoExpand || userPickedGame));
 
     const g = state.game;
+    const gNorm = normalizeFilterGame(g);
     const isAll = (g === 'all');
     const isAllServers = (g === 'all_servers');
     const filteredRooms = isAllServers || isAll
       ? state.rooms
       : state.rooms.filter(r => roomMatchesFilterGame(r, g));
     const onlineCount = state.servers.filter(s => s.status === 'online').length;
-    document.getElementById('ovServers').textContent = `${onlineCount}/${state.servers.length}`;
-    document.getElementById('ovOnline').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
-    document.getElementById('ovIdle').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
-    document.getElementById('ovRooms').textContent = filteredRooms.length;
+    const ovServers = document.getElementById('ovServers');
+    const ovOnline = document.getElementById('ovOnline');
+    const ovIdle = document.getElementById('ovIdle');
+    const ovRooms = document.getElementById('ovRooms');
+    if (ovServers) ovServers.textContent = `${onlineCount}/${state.servers.length}`;
+    if (ovOnline) ovOnline.textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
+    if (ovIdle) ovIdle.textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
+    if (ovRooms) ovRooms.textContent = filteredRooms.length;
+
+    // 立即同步所有房间条目的可见性（不要等下一轮 render）
     document.querySelectorAll('.room-item').forEach(el => {
-      const roomGame = el.dataset.gameKey || normalizeFilterGame(el.dataset.game);
-      el.style.display = (isAll || isAllServers || roomGame === normalizeFilterGame(g)) ? '' : 'none';
+      const roomGame = normalizeFilterGame(el.dataset.gameKey || el.dataset.game);
+      const show = isAll || isAllServers || roomGame === gNorm || roomMatchesFilterGame({ game: el.dataset.game }, g);
+      // 用空字符串恢复默认显示，避免残留 inline none
+      el.style.display = show ? '' : 'none';
     });
+
     state.servers.forEach(s => {
       const group = document.querySelector(`.server-group[data-id="${s.id}"]`);
       if (!group) return;
@@ -5642,7 +5655,10 @@ html:not(.dark) {
         );
         if (visible > 0 || hasKeptMatch) {
           group.style.display = '';
-          if (effectiveAutoExpand && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
+          if (effectiveAutoExpand && !group.classList.contains('open')) {
+            group.classList.add('open');
+            state.expanded.add(s.id);
+          }
           group.querySelectorAll('.no-rooms,.no-rooms-empty').forEach(el => el.style.display = 'none');
         } else {
           group.style.display = 'none';
@@ -5651,17 +5667,102 @@ html:not(.dark) {
       }
     });
     let gm = document.getElementById('no-server-match');
-    if (!isAll && !isAllServers && document.querySelectorAll('.server-group:not([style*="display: none"])').length === 0) {
-      if (!gm) { gm = document.createElement('div'); gm.id = 'no-server-match'; gm.className = 'no-rooms'; gm.style.cssText = 'text-align:center;padding:24px;font-size:14px;'; document.getElementById('serverList').appendChild(gm); }
+    // 用 style.display 可靠统计可见卡片
+    const visibleGroups = [...document.querySelectorAll('.server-group')].filter(el => el.style.display !== 'none');
+    if (!isAll && !isAllServers && visibleGroups.length === 0) {
+      if (!gm) {
+        gm = document.createElement('div');
+        gm.id = 'no-server-match';
+        gm.className = 'no-rooms';
+        gm.style.cssText = 'text-align:center;padding:24px;font-size:14px;';
+        document.getElementById('serverList').appendChild(gm);
+      }
       gm.textContent = `🔍 没有服务器有游戏「${g}」的房间`;
       gm.style.display = '';
-    } else if (gm) gm.style.display = 'none';
-
-    // 不再需要 checkOverflow
+    } else if (gm) {
+      gm.style.display = 'none';
+    }
   }
 
-  // ===== 拖拽排序 =====
+  // ===== 拖拽排序（含边缘自动滚动） =====
   let draggedEl = null;
+  // 长按拖动卡片到列表可视区域顶部/底部时，自动向上/向下滚动页面
+  const _cardDragScroll = {
+    active: false,
+    raf: 0,
+    lastY: 0,
+    // 边缘热区高度（px）与基础滚动速度（px/帧）
+    edge: 200,
+    maxSpeed: 1400
+  };
+
+  function _stopCardDragAutoScroll() {
+    _cardDragScroll.active = false;
+    if (_cardDragScroll.raf) {
+      cancelAnimationFrame(_cardDragScroll.raf);
+      _cardDragScroll.raf = 0;
+    }
+  }
+
+  function _cardDragAutoScrollTick() {
+    if (!_cardDragScroll.active || !draggedEl) {
+      _cardDragScroll.raf = 0;
+      return;
+    }
+    const y = _cardDragScroll.lastY;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const edge = _cardDragScroll.edge;
+    let dy = 0;
+    if (y < edge) {
+      // 越靠近顶部越快
+      const t = Math.max(0, (edge - y) / edge);
+      dy = -Math.ceil(_cardDragScroll.maxSpeed * (0.35 + 0.65 * t * t));
+    } else if (y > vh - edge) {
+      const t = Math.max(0, (y - (vh - edge)) / edge);
+      dy = Math.ceil(_cardDragScroll.maxSpeed * (0.35 + 0.65 * t * t));
+    }
+    if (dy) {
+      // 优先滚动窗口；若未来把列表放进可滚动容器，也兼容
+      const se = document.scrollingElement || document.documentElement || document.body;
+      const before = se.scrollTop;
+      se.scrollTop = before + dy;
+      if (se.scrollTop === before) {
+        window.scrollBy(0, dy);
+      }
+    }
+    _cardDragScroll.raf = requestAnimationFrame(_cardDragAutoScrollTick);
+  }
+
+  function _startCardDragAutoScroll() {
+    _cardDragScroll.active = true;
+    if (!_cardDragScroll.raf) {
+      _cardDragScroll.raf = requestAnimationFrame(_cardDragAutoScrollTick);
+    }
+  }
+
+  // 全局监听：拖拽过程中持续根据指针 Y 驱动边缘滚动
+  if (!window.__lanplayCardDragScrollBound) {
+    window.__lanplayCardDragScrollBound = true;
+    const onDragPos = (e) => {
+      if (!draggedEl) return;
+      // dragover / drag 事件在多数 WebView 都有 clientY
+      if (typeof e.clientY === 'number' && e.clientY > 0) {
+        _cardDragScroll.lastY = e.clientY;
+      }
+      _startCardDragAutoScroll();
+    };
+    document.addEventListener('dragover', onDragPos, { passive: true, capture: true });
+    document.addEventListener('drag', onDragPos, { passive: true, capture: true });
+    // 部分 Android WebView 在拖拽时更可靠地派发 pointermove
+    document.addEventListener('pointermove', (e) => {
+      if (!draggedEl) return;
+      if (typeof e.clientY === 'number') _cardDragScroll.lastY = e.clientY;
+      _startCardDragAutoScroll();
+    }, { passive: true, capture: true });
+    document.addEventListener('dragend', _stopCardDragAutoScroll, true);
+    document.addEventListener('drop', _stopCardDragAutoScroll, true);
+  }
+
   function initDragAndDrop(div, s) {
     div.setAttribute('draggable', 'true');
     // 记录按下位置，供 dragstart 计算拖影相对卡片的偏移，使拖影与卡片对齐
@@ -5679,9 +5780,14 @@ html:not(.dark) {
         e.stopPropagation();
         div.classList.remove('dragging');
         draggedEl = null;
+        _stopCardDragAutoScroll();
         return;
       }
       draggedEl = div;
+      if (typeof e.clientY === 'number' && e.clientY > 0) {
+        _cardDragScroll.lastY = e.clientY;
+      }
+      _startCardDragAutoScroll();
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         try {
@@ -5697,13 +5803,21 @@ html:not(.dark) {
     div.addEventListener('dragend', () => {
       div.classList.remove('dragging');
       draggedEl = null;
+      _stopCardDragAutoScroll();
       document.querySelectorAll('.server-group').forEach(el => el.classList.remove('drag-over'));
     });
-    div.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (div !== draggedEl) div.classList.add('drag-over'); });
+    div.addEventListener('dragover', e => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      if (typeof e.clientY === 'number') _cardDragScroll.lastY = e.clientY;
+      _startCardDragAutoScroll();
+      if (div !== draggedEl) div.classList.add('drag-over');
+    });
     div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
     div.addEventListener('drop', e => {
       e.preventDefault();
       div.classList.remove('drag-over');
+      _stopCardDragAutoScroll();
       if (draggedEl && draggedEl !== div) {
         const list = document.getElementById('serverList');
         const all = [...list.querySelectorAll('.server-group')];
@@ -11288,26 +11402,36 @@ html:not(.dark) {
     const tabs = ['all_servers', 'all', ...games];
     const container = document.getElementById('filters');
     if (!container) return;
+
+    // 事件委托：只绑定一次，避免按钮复用/增减后点击失效或延迟生效
+    if (!container._filterDelegated) {
+      container._filterDelegated = true;
+      container.addEventListener('click', (ev) => {
+        const btn = ev.target && ev.target.closest ? ev.target.closest('.filter-tab') : null;
+        if (!btn || !container.contains(btn)) return;
+        const gameKey = btn.dataset.game;
+        if (!gameKey) return;
+        // 立即切换 active 态，避免等下一帧才高亮
+        container.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.game = gameKey;
+        // 游戏标题 / 全部：自动展开匹配卡片；总房间：不强制展开
+        const autoExpand = gameKey !== 'all';
+        // 同步立刻应用筛选（房间显示/隐藏 + 卡片显隐）
+        applyFilter(autoExpand);
+        // 再微任务补一次，覆盖同帧内可能发生的 renderServers 覆盖 display
+        Promise.resolve().then(() => {
+          if (state.game === gameKey) applyFilter(autoExpand);
+        });
+      });
+    }
+
     const existing = container.children;
 
     while (existing.length < tabs.length) {
       const btn = document.createElement('button');
       btn.className = 'filter-tab';
-      btn.addEventListener('click', () => {
-        container.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        state.game = btn.dataset.game;
-
-        let autoExpand = true;
-        if (btn.dataset.game === 'all') {
-          autoExpand = false;
-        } else if (btn.dataset.game === 'all_servers') {
-          autoExpand = true;
-        } else {
-          autoExpand = true;
-        }
-        applyFilter(autoExpand);
-      });
+      btn.type = 'button';
       container.appendChild(btn);
     }
 
@@ -11327,13 +11451,15 @@ html:not(.dark) {
       let label;
       if (g === 'all') label = `总房间 (${state.rooms.length})`;
       else if (g === 'all_servers') label = `全部 (${state.servers.length})`;
-      else label = esc(g);
+      else label = g; // 文本节点不需要 HTML escape；textContent 本身安全
       btn.dataset.game = g;
       btn.textContent = label;
 
       const active = (g === 'all' && state.game === 'all') ||
         (g === 'all_servers' && state.game === 'all_servers') ||
-        (g !== 'all' && g !== 'all_servers' && state.game === g);
+        (g !== 'all' && g !== 'all_servers' && (
+          state.game === g || normalizeFilterGame(state.game) === normalizeFilterGame(g)
+        ));
       btn.classList.toggle('active', active);
     });
   }
