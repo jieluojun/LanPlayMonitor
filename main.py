@@ -39,11 +39,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ============================================================================
 
 class LogCapturer:
-    """日志捕获器：所有"种类"重复的日志自动合并为一条，并在行尾追加更新时间。
+    """日志捕获器：同一种类的重复日志采用“替换”方式。
 
     “种类”判定：把时间戳、UUID、长十六进制串、数字等易变内容归一化后，
-    剩余文本相同的日志视为同一种类 —— 合并为一条，展示最新原文，
-    并追加：重复次数（>1 时）与最后更新时间。
+    剩余文本相同的日志视为同一种类。再次出现时直接替换原条目的内容和更新时间，
+    不追加新行，也不显示重复次数；条目在列表中的原位置保持不变。
     """
 
     _RE_ISO_TS = re.compile(
@@ -59,9 +59,12 @@ class LogCapturer:
     def __init__(self, maxlen: int = 500):
         self.terminal = sys.stdout
         self.maxlen = maxlen
-        # kind_key -> [最新原文, 出现次数, 首次时间, 最后更新时间]（按最后更新排序）
+        # kind_key -> [最新原文, 首次时间, 最后更新时间]
+        # OrderedDict 的顺序代表首次出现顺序；重复日志只替换内容，不移动位置。
         self.entries: OrderedDict[str, list[Any]] = OrderedDict()
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
+        self.version = 0
 
     @classmethod
     def _kind_key(cls, msg: str) -> str:
@@ -86,15 +89,15 @@ class LogCapturer:
             with self.lock:
                 entry = self.entries.get(key)
                 if entry is not None:
-                    # 同种类：合并 → 更新原文/次数/更新时间，并移到末尾（最新活动排最后）
+                    # 同种类：直接替换原条目；不追加、不计数、不改变条目位置。
                     entry[0] = msg_stripped
-                    entry[1] += 1
-                    entry[3] = now
-                    self.entries.move_to_end(key)
+                    entry[2] = now
                 else:
-                    self.entries[key] = [msg_stripped, 1, now, now]
+                    self.entries[key] = [msg_stripped, now, now]
                     if len(self.entries) > self.maxlen:
-                        self.entries.popitem(last=False)  # 淘汰最久未更新的
+                        self.entries.popitem(last=False)  # 淘汰最早出现的条目
+                self.version += 1
+                self.changed.notify_all()
 
     def flush(self):
         if self.terminal:
@@ -102,22 +105,32 @@ class LogCapturer:
 
     @staticmethod
     def _format(entry: list[Any]) -> str:
-        text, count, _first, last = entry
+        text, _first, last = entry
         last_dt = datetime.fromtimestamp(last)
         fmt = "%H:%M:%S" if last_dt.date() == datetime.now().date() else "%m-%d %H:%M:%S"
         ts = last_dt.strftime(fmt)
-        if count > 1:
-            return f"{text} | 重复×{count} | 更新于 {ts}"
         return f"{text} | 更新于 {ts}"
 
     def get_logs(self) -> list[str]:
         with self.lock:
             return [self._format(e) for e in self.entries.values()]
 
-    def get_logs_tail(self, n: int = 200) -> list[str]:
+    def get_logs_snapshot(self, n: int = 200) -> tuple[int, list[str]]:
         with self.lock:
             items = [self._format(e) for e in self.entries.values()]
-            return items[-n:] if len(items) > n else items
+            return self.version, (items[-n:] if len(items) > n else items)
+
+    def wait_for_change(self, version: int) -> tuple[int, list[str]]:
+        # 持续等待，只有日志版本发生变化时才返回；不设置超时。
+        with self.changed:
+            while self.version == version:
+                self.changed.wait()
+            items = [self._format(e) for e in self.entries.values()]
+            return self.version, (items[-200:] if len(items) > 200 else items)
+
+    def get_logs_tail(self, n: int = 200) -> list[str]:
+        _version, items = self.get_logs_snapshot(n)
+        return items
 
 
 log_capturer = LogCapturer()
@@ -3066,7 +3079,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/logs":
                 try:
-                    logs = log_capturer.get_logs_tail(200)
+                    # 日志采用长轮询：只有日志版本发生变化时才立即返回，
+                    # 不再按固定间隔跟随页面轮询刷新。
+                    try:
+                        since_version = max(0, int(query.get("version", "-1")))
+                    except (TypeError, ValueError):
+                        since_version = -1
+                    wait_logs = query.get("wait", "0").strip().lower() in {"1", "true", "yes"}
+                    if wait_logs and since_version >= 0:
+                        log_version, logs = log_capturer.wait_for_change(since_version)
+                    else:
+                        log_version, logs = log_capturer.get_logs_snapshot(200)
                     with _download_status_lock:
                         st = dict(_download_status)
                     log_lines = list(logs)
@@ -3101,7 +3124,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     else:
                         ts = st.get("chinese_db_last_success", 0)
                         log_lines.append(f"[远程下载] 标题映射: 正常 | 上次成功: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "[远程下载] 标题映射: 正常")
-                    data = {"ok": True, "logs": log_lines}
+                    data = {"ok": True, "logs": log_lines, "version": log_version}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
                     data = {"ok": False, "error": str(e)}

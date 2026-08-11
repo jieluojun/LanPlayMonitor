@@ -4953,7 +4953,9 @@ html:not(.dark) {
   const logModal = document.getElementById('logModal');
   const logContent = document.getElementById('logContent');
   const logAutoScrollCheckbox = document.getElementById('logAutoScrollCheckbox');
-  let logInterval = null;
+  let logPollToken = 0;
+  let logAbortController = null;
+  let logVersion = -1;
   const LOG_AUTOSCROLL_KEY = 'lanplay_log_autoscroll';
   let logAutoScroll = localStorage.getItem(LOG_AUTOSCROLL_KEY) !== '0';
 
@@ -4968,30 +4970,57 @@ html:not(.dark) {
     });
   }
 
-  async function fetchLogs() {
+  function renderLogs(d) {
+    if (!d || !Array.isArray(d.logs) || !logContent) return;
+    logContent.textContent = d.logs.join('\n');
+    if (Number.isFinite(Number(d.version))) logVersion = Number(d.version);
+    if (logAutoScroll) logContent.scrollTop = logContent.scrollHeight;
+  }
+
+  async function fetchLogs(waitForChange, token) {
+    if (!logModal.classList.contains('open') || token !== logPollToken) return;
+    if (logAbortController) logAbortController.abort();
+    logAbortController = new AbortController();
+    const params = new URLSearchParams({
+      version: String(logVersion),
+      wait: waitForChange ? '1' : '0',
+      _: String(Date.now())
+    });
     try {
-      const d = await getJSON('/api/logs');
-      if (d.ok && Array.isArray(d.logs)) {
-        logContent.textContent = d.logs.join('\n');
-        if (logAutoScroll) {
-          logContent.scrollTop = logContent.scrollHeight;
-        }
-      }
+      const r = await fetch('/api/logs?' + params.toString(), {
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store',
+        signal: logAbortController.signal
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) throw new Error(d.error || `请求失败 (${r.status})`);
+      if (token !== logPollToken || !logModal.classList.contains('open')) return;
+      renderLogs(d);
+      // 服务端仅在日志版本发生变化后返回；随后立即进入下一次等待。
+      await fetchLogs(true, token);
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      if (token !== logPollToken || !logModal.classList.contains('open')) return;
       logContent.textContent = '加载日志失败: ' + e.message;
+      // 网络短暂异常时低频重试，不影响正常的日志变化同步。
+      setTimeout(() => fetchLogs(true, token), 1500);
     }
   }
 
   document.getElementById('openLogModalBtn').addEventListener('click', () => {
     logModal.classList.add('open');
     if (logAutoScrollCheckbox) logAutoScrollCheckbox.checked = logAutoScroll;
-    fetchLogs();
-    if (logInterval) clearInterval(logInterval);
-    logInterval = setInterval(fetchLogs, 2000);
+    logPollToken += 1;
+    logVersion = -1;
+    fetchLogs(false, logPollToken);
   });
   document.getElementById('closeLogBtn').addEventListener('click', () => {
     logModal.classList.remove('open');
-    if (logInterval) clearInterval(logInterval);
+    logPollToken += 1;
+    if (logAbortController) {
+      logAbortController.abort();
+      logAbortController = null;
+    }
   });
   // ===== 辅助函数 =====
   const statusDot = s => s === 'online' ? 'online' : s === 'checking' ? 'checking' : 'offline';
@@ -12146,7 +12175,8 @@ html:not(.dark) {
   window.addEventListener('beforeunload', () => {
     if (state.pollInterval) clearInterval(state.pollInterval);
     if (netCheckTimer) clearInterval(netCheckTimer);
-    if (logInterval) clearInterval(logInterval);
+    logPollToken += 1;
+    if (logAbortController) logAbortController.abort();
     if (refreshTimer) clearTimeout(refreshTimer);
     if (goEasyInitTimer) clearTimeout(goEasyInitTimer);
     if (presenceRefreshTimer) clearInterval(presenceRefreshTimer);
