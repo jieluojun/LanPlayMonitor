@@ -5222,53 +5222,60 @@ html:not(.dark) {
     return `<span class="server-address ellipsis" data-copytext="${esc(copyText)}" title="点击复制服务器地址: ${esc(copyText)}">${escaped}</span>`;
   }
 
-  // ===== roomCard =====
-  function roomCard(room) {
-    const players = Array.isArray(room.players) ? room.players : [];
-    const count = `${room.node_count || players.length}${room.node_count_max ? ' / ' + room.node_count_max : ''} 人`;
-    const gameVal = String(room.game || '');
-    const contentId = String(room.content_id || '').toUpperCase();
-    const isUnknownId = contentId === UNKNOWN_ID;
-    const isUnknown = gameVal.includes('未知游戏') && !isUnknownId;
-    const iconUrl = room.game_icon || QUESTION_ICON_DATA;
-    const finalIcon = (isUnknown || !iconUrl || iconUrl === '') ? QUESTION_ICON_DATA : iconUrl;
+/**
+ * 生成单个房间卡片的 HTML
+ * @param {Object} room - 房间数据
+ * @param {string} display - 初始显示状态 ('none' 或 ''，默认为 '' 显示)
+ * @returns {string} HTML 字符串
+ */
+function roomCard(room, display) {
+  const players = Array.isArray(room.players) ? room.players : [];
+  const count = `${room.node_count || players.length}${room.node_count_max ? ' / ' + room.node_count_max : ''} 人`;
+  const gameVal = String(room.game || '');
+  const contentId = String(room.content_id || '').toUpperCase();
+  const isUnknownId = contentId === UNKNOWN_ID;
+  const isUnknown = gameVal.includes('未知游戏') && !isUnknownId;
+  const iconUrl = room.game_icon || QUESTION_ICON_DATA;
+  const finalIcon = (isUnknown || !iconUrl || iconUrl === '') ? QUESTION_ICON_DATA : iconUrl;
 
-    let iconHtml;
-    if (contentId === UNKNOWN_ID) {
-      iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;cursor:default;" title="${esc(room.game)}">?</span>`;
-    } else {
-      iconHtml = `<img src="${finalIcon}" alt="${esc(room.game)}" title="点击放大查看 - ${esc(room.game)}" class="room-icon" loading="lazy" data-full="${esc(finalIcon)}" draggable="false" style="cursor:zoom-in;" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
-    }
-
-    const gameDisplay = gameVal;
-    const canCopy = isUnknown && !isUnknownId;
-    const copyClass = canCopy ? 'copy-game-id' : 'no-copy';
-    const gameTitle = canCopy ? `点击复制游戏 ID: ${contentId}` : gameVal;
-
-    let gameNameHtml = `<span class="game-name ${copyClass} ellipsis" data-contentid="${esc(contentId)}" data-isunknown="${canCopy ? 'true' : 'false'}" title="${esc(gameTitle)}">${esc(gameDisplay)}</span>`;
-
-    const hostName = room.host || '未知房间';
-    let hostHtml = `<span class="room-host-meta"><span class="host-icon-fixed">🏠</span><span class="host-name ellipsis">${esc(hostName)}</span></span>`;
-
-    const roomId = esc(room.id || '');
-    const gameKey = normalizeFilterGame(gameVal);
-    return `<div class="room-item" data-game="${esc(gameVal)}" data-game-key="${esc(gameKey)}" data-room-id="${roomId}">
-      <div class="room-top">
-        <div class="room-game-left">
-          ${iconHtml}
-          ${gameNameHtml}
-        </div>
-      </div>
-      <div class="room-meta">
-        <span class="green">● 正在联机</span>
-        <span>|</span>
-        <span>${esc(count)}</span>
-        <span>|</span>
-        ${hostHtml}
-      </div>
-      <div class="room-players">${players.map(p => `<span class="player">${esc(p)}</span>`).join('')}</div>
-    </div>`;
+  let iconHtml;
+  if (contentId === UNKNOWN_ID) {
+    iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;cursor:default;" title="${esc(room.game)}">?</span>`;
+  } else {
+    iconHtml = `<img src="${finalIcon}" alt="${esc(room.game)}" title="点击放大查看 - ${esc(room.game)}" class="room-icon" loading="lazy" data-full="${esc(finalIcon)}" draggable="false" style="cursor:zoom-in;" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
   }
+
+  const gameDisplay = gameVal;
+  const canCopy = isUnknown && !isUnknownId;
+  const copyClass = canCopy ? 'copy-game-id' : 'no-copy';
+  const gameTitle = canCopy ? `点击复制游戏 ID: ${contentId}` : gameVal;
+
+  let gameNameHtml = `<span class="game-name ${copyClass} ellipsis" data-contentid="${esc(contentId)}" data-isunknown="${canCopy ? 'true' : 'false'}" title="${esc(gameTitle)}">${esc(gameDisplay)}</span>`;
+
+  const hostName = room.host || '未知房间';
+  let hostHtml = `<span class="room-host-meta"><span class="host-icon-fixed">🏠</span><span class="host-name ellipsis">${esc(hostName)}</span></span>`;
+
+  const roomId = esc(room.id || '');
+  const gameKey = normalizeFilterGame(gameVal);
+  // ★★★ 修复：通过 display 参数控制初始显示状态，避免闪现 ★★★
+  const displayStyle = display === 'none' ? 'display:none;' : '';
+  return `<div class="room-item" data-game="${esc(gameVal)}" data-game-key="${esc(gameKey)}" data-room-id="${roomId}" style="${displayStyle}">
+    <div class="room-top">
+      <div class="room-game-left">
+        ${iconHtml}
+        ${gameNameHtml}
+      </div>
+    </div>
+    <div class="room-meta">
+      <span class="green">● 正在联机</span>
+      <span>|</span>
+      <span>${esc(count)}</span>
+      <span>|</span>
+      ${hostHtml}
+    </div>
+    <div class="room-players">${players.map(p => `<span class="player">${esc(p)}</span>`).join('')}</div>
+  </div>`;
+}
 
   // ===== 新消息数字角标相关函数 =====
   function normalizeUnreadCount(v) {
@@ -10870,266 +10877,288 @@ html:not(.dark) {
     }
   }
 
-  // ============================================================
-  // ========== 渲染服务器列表 ==========
-  // ============================================================
-  function renderServers() {
-    const list = document.getElementById('serverList');
-    const roomsByServer = {};
-    state.rooms.forEach(r => { (roomsByServer[r.server_id] = roomsByServer[r.server_id] || []).push(r); });
-    const onlineCount = state.servers.filter(s => s.status === 'online').length;
-    document.getElementById('ovServers').textContent = `${onlineCount}/${state.servers.length}`;
-    document.getElementById('ovOnline').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
-    document.getElementById('ovIdle').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
-    document.getElementById('ovRooms').textContent = state.rooms.length;
-    if (!state.servers.length) { if (state.firstLoad) { list.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>'; } return; }
+/**
+ * 渲染所有服务器卡片及其房间列表
+ * 每次调用都会根据当前 state.servers 和 state.rooms 重建 DOM
+ * 通过为每个房间设置初始 display 属性，避免闪现，同时保证自动展开后立即显示当前游戏房间
+ */
+function renderServers() {
+  const list = document.getElementById('serverList');
+  
+  // 按 server_id 分组房间
+  const roomsByServer = {};
+  state.rooms.forEach(r => { (roomsByServer[r.server_id] = roomsByServer[r.server_id] || []).push(r); });
+  
+  // 更新统计概览
+  const onlineCount = state.servers.filter(s => s.status === 'online').length;
+  document.getElementById('ovServers').textContent = `${onlineCount}/${state.servers.length}`;
+  document.getElementById('ovOnline').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
+  document.getElementById('ovIdle').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
+  document.getElementById('ovRooms').textContent = state.rooms.length;
+  
+  // 首次加载显示骨架屏
+  if (!state.servers.length) { if (state.firstLoad) { list.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>'; } return; }
 
-    const existing = state._domCache;
-    if (existing.size === 0) list.querySelectorAll('.server-group').forEach(el => existing.set(el.dataset.id, el));
-    const currentIds = new Set(state.servers.map(s => s.id));
-    for (const [id, el] of existing) if (!currentIds.has(id)) { el.remove(); existing.delete(id); }
+  // DOM 缓存管理：复用已存在的卡片，避免完全重绘
+  const existing = state._domCache;
+  if (existing.size === 0) list.querySelectorAll('.server-group').forEach(el => existing.set(el.dataset.id, el));
+  const currentIds = new Set(state.servers.map(s => s.id));
+  for (const [id, el] of existing) if (!currentIds.has(id)) { el.remove(); existing.delete(id); }
 
-    const order = [];
-    state.servers.forEach(s => {
-      const dot = statusDot(s.status);
-      const rooms = roomsByServer[s.id] || [];
-      const regionHtml = s.region ? `<span class="card-region" title="${esc(s.region)}">${esc(s.region)}</span>` : '';
-      const typeBadgeHtml = getTypeBadge(s);
-      const errText = s.error ? String(s.error) : '';
-      const newRoomsHtml = rooms.length ? `<div class="room-list">${rooms.map(r => roomCard(r)).join('')}</div>` : '';
-      let group = existing.get(s.id);
-      const address = s.address || `${s.host}:${s.port}`;
+  const order = [];
+  state.servers.forEach(s => {
+    const dot = statusDot(s.status);
+    const rooms = roomsByServer[s.id] || [];
+    
+    // ★★★ 修复：生成所有房间，但根据当前游戏设置初始显示状态，避免闪现 ★★★
+    const isAllOrAllServers = (state.game === 'all' || state.game === 'all_servers');
+    const newRoomsHtml = rooms.length ? `<div class="room-list">${rooms.map(r => {
+      // 计算是否应该显示：若当前游戏为 all 或 all_servers，则全部显示；否则只显示匹配的游戏
+      const shouldShow = isAllOrAllServers || roomMatchesFilterGame(r, state.game);
+      return roomCard(r, shouldShow ? '' : 'none');
+    }).join('')}</div>` : '';
+    
+    const regionHtml = s.region ? `<span class="card-region" title="${esc(s.region)}">${esc(s.region)}</span>` : '';
+    const typeBadgeHtml = getTypeBadge(s);
+    const errText = s.error ? String(s.error) : '';
+    let group = existing.get(s.id);
+    const address = s.address || `${s.host}:${s.port}`;
 
-      if (group) {
-        const dotEl = group.querySelector('.server-status-dot');
-        if (dotEl && dotEl.className !== 'server-status-dot ' + dot) dotEl.className = 'server-status-dot ' + dot;
+    if (group) {
+      // ----- 更新已存在的卡片（只更新变化部分） -----
+      const dotEl = group.querySelector('.server-status-dot');
+      if (dotEl && dotEl.className !== 'server-status-dot ' + dot) dotEl.className = 'server-status-dot ' + dot;
 
-        let nameEl = group.querySelector('.server-name');
-        if (nameEl) {
-          nameEl.textContent = s.name;
-          nameEl.dataset.copytext = s.name;
-          nameEl.classList.remove('short-text'); // 不需要 short-text
-        } else {
-          const info = group.querySelector('.server-info');
-          if (info) {
-            const newHtml = makeServerNameHtml(s.name, s.name);
-            info.insertAdjacentHTML('afterbegin', newHtml);
-          }
-        }
-
-        let addrEl = group.querySelector('.server-address');
-        if (addrEl) {
-          addrEl.textContent = address;
-          addrEl.dataset.copytext = address;
-          addrEl.classList.remove('short-text');
-        } else {
-          const info = group.querySelector('.server-info');
-          if (info) {
-            const newHtml = makeServerAddressHtml(address, address);
-            info.appendChild(createElementFromHTML(newHtml));
-          }
-        }
-
-        const infoEl = group.querySelector('.server-info');
-        // 统一维护 server-tags 容器，保证地区与类型标签左缘对齐
-        if (infoEl) {
-          let tagsEl = infoEl.querySelector('.server-tags');
-          const needTags = !!(regionHtml || typeBadgeHtml);
-          if (!needTags) {
-            if (tagsEl) tagsEl.remove();
-            // 兼容旧 DOM：散落的标签一并清掉
-            infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => el.remove());
-          } else {
-            if (!tagsEl) {
-              tagsEl = document.createElement('div');
-              tagsEl.className = 'server-tags';
-              const addr = infoEl.querySelector('.server-address');
-              if (addr && addr.nextSibling) infoEl.insertBefore(tagsEl, addr.nextSibling);
-              else if (addr) infoEl.appendChild(tagsEl);
-              else infoEl.appendChild(tagsEl);
-            }
-            // 迁移旧版散落在 info 下的标签进容器
-            infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => {
-              tagsEl.appendChild(el);
-            });
-            let regionEl = tagsEl.querySelector('.card-region');
-            if (s.region) {
-              if (!regionEl) {
-                regionEl = document.createElement('span');
-                regionEl.className = 'card-region';
-                tagsEl.insertBefore(regionEl, tagsEl.firstChild);
-              }
-              if (regionEl.textContent !== s.region) {
-                regionEl.textContent = s.region;
-                regionEl.title = s.region;
-              }
-            } else if (regionEl) {
-              regionEl.remove();
-            }
-            let typeEl = tagsEl.querySelector('.server-type-badge');
-            const newType = s.is_builtin ? '内置' : s.is_remote ? '远程' : s.is_manual ? '自定义' : '';
-            const newCls = s.is_builtin ? 'builtin' : s.is_remote ? 'remote' : s.is_manual ? 'manual' : '';
-            if (newType) {
-              if (!typeEl) {
-                typeEl = document.createElement('span');
-                tagsEl.appendChild(typeEl);
-              }
-              typeEl.textContent = newType;
-              typeEl.className = 'server-type-badge ' + newCls;
-            } else if (typeEl) {
-              typeEl.remove();
-            }
-            if (!tagsEl.childElementCount) tagsEl.remove();
-          }
-        }
-
-        const statBs = group.querySelectorAll('.stat-item b');
-        if (statBs.length >= 3) {
-          statBs[0].textContent = String(s.online || 0);
-          statBs[1].textContent = String(s.idle || 0);
-          statBs[2].textContent = String(s.room_count || 0);
-        }
-        const latEl = group.querySelector('.stat-item.latency');
-        if (latEl) {
-          const nb = latEl.querySelector('.latency-badge');
-          const nl = latencyHTML(s);
-          if (!nb || nb.outerHTML !== nl) latEl.innerHTML = `<span>延迟</span>${nl}`;
-        }
-
-        const shouldOpen = state.expanded.has(s.id);
-        const isOpen = group.classList.contains('open');
-        if (shouldOpen !== isOpen) group.classList.toggle('open', shouldOpen);
-
-        // 错误角标：卡片顶部居中，文案随错误变化
-        ensureErrorBadge(group, errText);
-
-        // 始终更新房间列表；不碰聊天 DOM，避免输入法被收起
-        const body = group.querySelector('.server-body');
-        if (body) {
-          const bodyInner = body.querySelector('.body-inner');
-          if (bodyInner) {
-            const chatWrapper = bodyInner.querySelector('.chat-wrapper');
-            // 清理旧版横幅错误 + 房间列表，绝不移除聊天区
-            bodyInner.querySelectorAll('.server-error, .room-list, .no-rooms-empty, .no-rooms-match, .no-rooms').forEach(el => {
-              if (!chatWrapper || !chatWrapper.contains(el)) el.remove();
-            });
-
-            // 顺序：聊天 → 房间列表
-            if (newRoomsHtml) {
-              const temp = document.createElement('div');
-              temp.innerHTML = newRoomsHtml;
-              const roomList = temp.firstElementChild;
-              if (chatWrapper) {
-                if (chatWrapper.nextSibling) bodyInner.insertBefore(roomList, chatWrapper.nextSibling);
-                else bodyInner.appendChild(roomList);
-              } else {
-                bodyInner.appendChild(roomList);
-              }
-            }
-          }
-        }
-        // 聊天区已存在时不要反复 init；仅确保消息增量更新
-        if (!group.querySelector('.chat-wrapper')) {
-          initChatForCard(s.id, group);
-        } else {
-          renderChatMessages(s.id, false);
-        }
-
-        ensureUnreadIndicator(group, s.id);
-
+      let nameEl = group.querySelector('.server-name');
+      if (nameEl) {
+        nameEl.textContent = s.name;
+        nameEl.dataset.copytext = s.name;
+        nameEl.classList.remove('short-text');
       } else {
-        const isOpen = state.expanded.has(s.id) ? 'open' : '';
-        const nameHtml = makeServerNameHtml(s.name, s.name);
-        const addrHtml = makeServerAddressHtml(address, address);
-        const unreadCount = getUnreadCount(s.id);
-        const indicatorStyle = unreadCount > 0 ? 'inline-block' : 'none';
-        const indicatorText = unreadCount > 99 ? '99+' : (unreadCount > 0 ? String(unreadCount) : '');
+        const info = group.querySelector('.server-info');
+        if (info) {
+          const newHtml = makeServerNameHtml(s.name, s.name);
+          info.insertAdjacentHTML('afterbegin', newHtml);
+        }
+      }
 
-        const actionsHtml = s.is_manual ? `
-          <div class="server-actions">
-            <button class="action-btn action-edit">编辑</button>
-            <button class="action-btn action-delete">删除</button>
-          </div>` : '';
+      let addrEl = group.querySelector('.server-address');
+      if (addrEl) {
+        addrEl.textContent = address;
+        addrEl.dataset.copytext = address;
+        addrEl.classList.remove('short-text');
+      } else {
+        const info = group.querySelector('.server-info');
+        if (info) {
+          const newHtml = makeServerAddressHtml(address, address);
+          info.appendChild(createElementFromHTML(newHtml));
+        }
+      }
 
-        const div = document.createElement('div');
-        div.className = `server-group ${isOpen}`;
-        div.dataset.id = s.id;
-        div.innerHTML = `
-          ${actionsHtml}
-          <div class="server-card-inner">
-            <div class="server-head">
-              <div class="server-status-dot ${dot}"></div>
-              <div class="server-info">
-                ${nameHtml}
-                ${addrHtml}
-                ${buildServerTagsHtml(regionHtml, typeBadgeHtml)}
-                <div class="server-detail"></div>
-              </div>
-              <span class="unread-indicator" data-server-id="${s.id}" style="display: ${indicatorStyle};">${indicatorText}</span>
-              <div class="server-stats">
-                <div class="stat-item online"><span>在线</span><b>${s.online || 0}</b></div>
-                <div class="stat-item idle"><span>空闲</span><b>${s.idle || 0}</b></div>
-                <div class="stat-item rooms"><span>房间</span><b>${s.room_count || 0}</b></div>
-                <div class="stat-item latency"><span>延迟</span>${latencyHTML(s)}</div>
-              </div>
+      // 更新地区标签和类型标签
+      const infoEl = group.querySelector('.server-info');
+      if (infoEl) {
+        let tagsEl = infoEl.querySelector('.server-tags');
+        const needTags = !!(regionHtml || typeBadgeHtml);
+        if (!needTags) {
+          if (tagsEl) tagsEl.remove();
+          infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => el.remove());
+        } else {
+          if (!tagsEl) {
+            tagsEl = document.createElement('div');
+            tagsEl.className = 'server-tags';
+            const addr = infoEl.querySelector('.server-address');
+            if (addr && addr.nextSibling) infoEl.insertBefore(tagsEl, addr.nextSibling);
+            else if (addr) infoEl.appendChild(tagsEl);
+            else infoEl.appendChild(tagsEl);
+          }
+          infoEl.querySelectorAll(':scope > .card-region, :scope > .server-type-badge').forEach(el => {
+            tagsEl.appendChild(el);
+          });
+          let regionEl = tagsEl.querySelector('.card-region');
+          if (s.region) {
+            if (!regionEl) {
+              regionEl = document.createElement('span');
+              regionEl.className = 'card-region';
+              tagsEl.insertBefore(regionEl, tagsEl.firstChild);
+            }
+            if (regionEl.textContent !== s.region) {
+              regionEl.textContent = s.region;
+              regionEl.title = s.region;
+            }
+          } else if (regionEl) {
+            regionEl.remove();
+          }
+          let typeEl = tagsEl.querySelector('.server-type-badge');
+          const newType = s.is_builtin ? '内置' : s.is_remote ? '远程' : s.is_manual ? '自定义' : '';
+          const newCls = s.is_builtin ? 'builtin' : s.is_remote ? 'remote' : s.is_manual ? 'manual' : '';
+          if (newType) {
+            if (!typeEl) {
+              typeEl = document.createElement('span');
+              tagsEl.appendChild(typeEl);
+            }
+            typeEl.textContent = newType;
+            typeEl.className = 'server-type-badge ' + newCls;
+          } else if (typeEl) {
+            typeEl.remove();
+          }
+          if (!tagsEl.childElementCount) tagsEl.remove();
+        }
+      }
+
+      // 更新统计数字
+      const statBs = group.querySelectorAll('.stat-item b');
+      if (statBs.length >= 3) {
+        statBs[0].textContent = String(s.online || 0);
+        statBs[1].textContent = String(s.idle || 0);
+        statBs[2].textContent = String(s.room_count || 0);
+      }
+      const latEl = group.querySelector('.stat-item.latency');
+      if (latEl) {
+        const nb = latEl.querySelector('.latency-badge');
+        const nl = latencyHTML(s);
+        if (!nb || nb.outerHTML !== nl) latEl.innerHTML = `<span>延迟</span>${nl}`;
+      }
+
+      // 展开/收起状态
+      const shouldOpen = state.expanded.has(s.id);
+      const isOpen = group.classList.contains('open');
+      if (shouldOpen !== isOpen) group.classList.toggle('open', shouldOpen);
+
+      // 错误角标
+      ensureErrorBadge(group, errText);
+
+      // 更新房间列表（保持聊天区不被移除）
+      const body = group.querySelector('.server-body');
+      if (body) {
+        const bodyInner = body.querySelector('.body-inner');
+        if (bodyInner) {
+          const chatWrapper = bodyInner.querySelector('.chat-wrapper');
+          // 移除旧房间列表，保留聊天区
+          bodyInner.querySelectorAll('.server-error, .room-list, .no-rooms-empty, .no-rooms-match, .no-rooms').forEach(el => {
+            if (!chatWrapper || !chatWrapper.contains(el)) el.remove();
+          });
+
+          if (newRoomsHtml) {
+            const temp = document.createElement('div');
+            temp.innerHTML = newRoomsHtml;
+            const roomList = temp.firstElementChild;
+            if (chatWrapper) {
+              if (chatWrapper.nextSibling) bodyInner.insertBefore(roomList, chatWrapper.nextSibling);
+              else bodyInner.appendChild(roomList);
+            } else {
+              bodyInner.appendChild(roomList);
+            }
+          }
+        }
+      }
+      // 确保聊天区存在
+      if (!group.querySelector('.chat-wrapper')) {
+        initChatForCard(s.id, group);
+      } else {
+        renderChatMessages(s.id, false);
+      }
+
+      // 更新未读角标
+      ensureUnreadIndicator(group, s.id);
+
+    } else {
+      // ----- 创建新卡片 -----
+      const isOpen = state.expanded.has(s.id) ? 'open' : '';
+      const nameHtml = makeServerNameHtml(s.name, s.name);
+      const addrHtml = makeServerAddressHtml(address, address);
+      const unreadCount = getUnreadCount(s.id);
+      const indicatorStyle = unreadCount > 0 ? 'inline-block' : 'none';
+      const indicatorText = unreadCount > 99 ? '99+' : (unreadCount > 0 ? String(unreadCount) : '');
+
+      const actionsHtml = s.is_manual ? `
+        <div class="server-actions">
+          <button class="action-btn action-edit">编辑</button>
+          <button class="action-btn action-delete">删除</button>
+        </div>` : '';
+
+      const div = document.createElement('div');
+      div.className = `server-group ${isOpen}`;
+      div.dataset.id = s.id;
+      div.innerHTML = `
+        ${actionsHtml}
+        <div class="server-card-inner">
+          <div class="server-head">
+            <div class="server-status-dot ${dot}"></div>
+            <div class="server-info">
+              ${nameHtml}
+              ${addrHtml}
+              ${buildServerTagsHtml(regionHtml, typeBadgeHtml)}
+              <div class="server-detail"></div>
             </div>
-            <div class="server-body">
-              <div class="body-inner">
-                ${newRoomsHtml}
-              </div>
+            <span class="unread-indicator" data-server-id="${s.id}" style="display: ${indicatorStyle};">${indicatorText}</span>
+            <div class="server-stats">
+              <div class="stat-item online"><span>在线</span><b>${s.online || 0}</b></div>
+              <div class="stat-item idle"><span>空闲</span><b>${s.idle || 0}</b></div>
+              <div class="stat-item rooms"><span>房间</span><b>${s.room_count || 0}</b></div>
+              <div class="stat-item latency"><span>延迟</span>${latencyHTML(s)}</div>
             </div>
           </div>
-        `;
-        ensureErrorBadge(div, errText);
+          <div class="server-body">
+            <div class="body-inner">
+              ${newRoomsHtml}
+            </div>
+          </div>
+        </div>
+      `;
+      ensureErrorBadge(div, errText);
 
-        const nameEl = div.querySelector('.server-name');
-        if (nameEl) {
-          nameEl.addEventListener('click', function (e) {
-            e.stopPropagation();
-            copyServerName(this.dataset.copytext, this);
-          });
-        }
-        const addrEl = div.querySelector('.server-address');
-        if (addrEl) {
-          addrEl.addEventListener('click', function (e) {
-            e.stopPropagation();
-            copyServerAddress(this.dataset.copytext, this);
-          });
-        }
-
-        initDragAndDrop(div, s);
-
-        if (s.is_manual) {
-          initSwipe(div);
-        } else {
-          const actions = div.querySelector('.server-actions');
-          if (actions) actions.style.display = 'none';
-        }
-
-        initChatForCard(s.id, div);
-        ensureUnreadIndicator(div, s.id);
-
-        existing.set(s.id, div);
+      // 绑定事件：复制服务器名/地址
+      const nameEl = div.querySelector('.server-name');
+      if (nameEl) {
+        nameEl.addEventListener('click', function (e) {
+          e.stopPropagation();
+          copyServerName(this.dataset.copytext, this);
+        });
       }
-      order.push(existing.get(s.id));
-    });
+      const addrEl = div.querySelector('.server-address');
+      if (addrEl) {
+        addrEl.addEventListener('click', function (e) {
+          e.stopPropagation();
+          copyServerAddress(this.dataset.copytext, this);
+        });
+      }
 
-    if (state.firstLoad || list.children.length === 0) {
-      list.innerHTML = '';
-      const frag = document.createDocumentFragment();
-      order.forEach(el => frag.appendChild(el));
-      list.appendChild(frag);
-      state.firstLoad = false;
-      saveCurrentOrder();
-    } else {
-      const cur = [...list.children];
-      let changed = cur.length !== order.length;
-      if (!changed) for (let i = 0; i < cur.length; i++) if (cur[i] !== order[i]) { changed = true; break; }
-      if (changed) { const frag = document.createDocumentFragment(); order.forEach(el => frag.appendChild(el)); list.appendChild(frag); }
+      // 拖拽排序
+      initDragAndDrop(div, s);
+
+      // 滑动操作（仅自定义服务器）
+      if (s.is_manual) {
+        initSwipe(div);
+      } else {
+        const actions = div.querySelector('.server-actions');
+        if (actions) actions.style.display = 'none';
+      }
+
+      // 初始化聊天
+      initChatForCard(s.id, div);
+      ensureUnreadIndicator(div, s.id);
+
+      existing.set(s.id, div);
     }
+    order.push(existing.get(s.id));
+  });
 
-    // 不再需要 checkOverflow
+  // 更新 DOM 顺序
+  if (state.firstLoad || list.children.length === 0) {
+    list.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    order.forEach(el => frag.appendChild(el));
+    list.appendChild(frag);
+    state.firstLoad = false;
+    saveCurrentOrder();
+  } else {
+    const cur = [...list.children];
+    let changed = cur.length !== order.length;
+    if (!changed) for (let i = 0; i < cur.length; i++) if (cur[i] !== order[i]) { changed = true; break; }
+    if (changed) { const frag = document.createDocumentFragment(); order.forEach(el => frag.appendChild(el)); list.appendChild(frag); }
   }
+}
 
   // ===== 全局事件：复制游戏 ID =====
   document.addEventListener('click', function (e) {
