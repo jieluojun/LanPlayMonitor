@@ -5576,96 +5576,99 @@ function roomCard(room, display) {
     return `<div class="server-tags">${regionHtml || ''}${typeBadgeHtml || ''}</div>`;
   }
 
-  // ===== 筛选应用 =====
-  function applyFilter(autoExpand) {
-    if (autoExpand === undefined) autoExpand = false;
-    // 正在卡片内聊天时，不允许筛选逻辑把其它卡片自动展开
-    let chattingNow = false;
-    if (state.autoExpand) {
-      for (let i = 0; i < state.servers.length; i++) {
-        if (isServerChatActive(state.servers[i].id)) { chattingNow = true; break; }
-      }
+// ===== 筛选应用 =====
+function applyFilter(autoExpand) {
+  if (autoExpand === undefined) autoExpand = false;
+  // 正在卡片内聊天时，不允许筛选逻辑把其它卡片自动展开
+  let chattingNow = false;
+  if (state.autoExpand) {
+    for (let i = 0; i < state.servers.length; i++) {
+      if (isServerChatActive(state.servers[i].id)) { chattingNow = true; break; }
     }
-    const effectiveAutoExpand = autoExpand && state.autoExpand && !chattingNow;
+  }
+  const effectiveAutoExpand = autoExpand && state.autoExpand && !chattingNow;
 
-    const g = state.game;
-    const isAll = (g === 'all');
-    const isAllServers = (g === 'all_servers');
-    const filteredRooms = isAllServers || isAll
-      ? state.rooms
-      : state.rooms.filter(r => roomMatchesFilterGame(r, g));
-    const onlineCount = state.servers.filter(s => s.status === 'online').length;
-    document.getElementById('ovServers').textContent = `${onlineCount}/${state.servers.length}`;
-    document.getElementById('ovOnline').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
-    document.getElementById('ovIdle').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
-    document.getElementById('ovRooms').textContent = filteredRooms.length;
-    document.querySelectorAll('.room-item').forEach(el => {
-      const roomGame = el.dataset.gameKey || normalizeFilterGame(el.dataset.game);
-      el.style.display = (isAll || isAllServers || roomGame === normalizeFilterGame(g)) ? '' : 'none';
-    });
-    state.servers.forEach(s => {
-      const group = document.querySelector(`.server-group[data-id="${s.id}"]`);
-      if (!group) return;
-      const items = group.querySelectorAll('.room-item');
-      let visible = 0;
-      items.forEach(el => { if (el.style.display !== 'none') visible++; });
-      const isOnline = s.status === 'online' && !s.error;
-      if (isAllServers) {
-        group.style.display = '';
-        if (effectiveAutoExpand && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
-        group.querySelectorAll('.no-rooms,.no-rooms-empty,.no-rooms-match').forEach(el => el.remove());
-        // 以数据源判断是否有房间，避免 DOM 尚未刷出房间列表时误显示“暂无公开房间”
-        const serverRoomCount = state.rooms.filter(r => r.server_id === s.id).length;
-        if (serverRoomCount === 0 && items.length === 0 && isOnline) {
-          let m = group.querySelector('.no-rooms-empty');
-          if (!m) {
-            m = document.createElement('div');
-            m.className = 'no-rooms-empty no-rooms';
-            m.textContent = '📭 该服务器暂无公开房间';
-            const body = group.querySelector('.server-body > .body-inner');
-            if (body) {
-              const chat = body.querySelector('.chat-wrapper');
-              if (chat) {
-                if (chat.nextSibling) body.insertBefore(m, chat.nextSibling);
-                else body.appendChild(m);
-              } else {
-                body.appendChild(m);
-              }
+  const g = state.game;
+  const isAll = (g === 'all');
+  const isAllServers = (g === 'all_servers');
+  const filteredRooms = isAllServers || isAll
+    ? state.rooms
+    : state.rooms.filter(r => roomMatchesFilterGame(r, g));
+  const onlineCount = state.servers.filter(s => s.status === 'online').length;
+  document.getElementById('ovServers').textContent = `${onlineCount}/${state.servers.length}`;
+  document.getElementById('ovOnline').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.online || 0), 0);
+  document.getElementById('ovIdle').textContent = state.servers.filter(s => s.status === 'online').reduce((a, s) => a + (s.idle || 0), 0);
+  document.getElementById('ovRooms').textContent = filteredRooms.length;
+  document.querySelectorAll('.room-item').forEach(el => {
+    const roomGame = el.dataset.gameKey || normalizeFilterGame(el.dataset.game);
+    el.style.display = (isAll || isAllServers || roomGame === normalizeFilterGame(g)) ? '' : 'none';
+  });
+  state.servers.forEach(s => {
+    const group = document.querySelector(`.server-group[data-id="${s.id}"]`);
+    if (!group) return;
+    const items = group.querySelectorAll('.room-item');
+    let visible = 0;
+    items.forEach(el => { if (el.style.display !== 'none') visible++; });
+    const isOnline = s.status === 'online' && !s.error;
+    if (isAllServers) {
+      group.style.display = '';
+      // ★★★ 修改点：只有该服务器实际有房间时才自动展开 ★★★
+      const hasRooms = state.rooms.some(r => r.server_id === s.id);
+      if (effectiveAutoExpand && !group.classList.contains('open') && hasRooms) {
+        group.classList.add('open');
+        state.expanded.add(s.id);
+      }
+      group.querySelectorAll('.no-rooms,.no-rooms-empty,.no-rooms-match').forEach(el => el.remove());
+      // 以数据源判断是否有房间，避免 DOM 尚未刷出房间列表时误显示“暂无公开房间”
+      const serverRoomCount = state.rooms.filter(r => r.server_id === s.id).length;
+      if (serverRoomCount === 0 && items.length === 0 && isOnline) {
+        let m = group.querySelector('.no-rooms-empty');
+        if (!m) {
+          m = document.createElement('div');
+          m.className = 'no-rooms-empty no-rooms';
+          m.textContent = '📭 该服务器暂无公开房间';
+          const body = group.querySelector('.server-body > .body-inner');
+          if (body) {
+            const chat = body.querySelector('.chat-wrapper');
+            if (chat) {
+              if (chat.nextSibling) body.insertBefore(m, chat.nextSibling);
+              else body.appendChild(m);
+            } else {
+              body.appendChild(m);
             }
           }
-          m.style.display = '';
         }
-      } else if (isAll) {
-        // 总房间：有保活房间就显示（不因短暂离线/超时隐藏）
-        const hasKept = state.rooms.some(r => r.server_id === s.id);
-        const hasAny = items.length > 0 || hasKept;
-        group.style.display = hasAny ? '' : 'none';
-        if (effectiveAutoExpand && hasAny && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
-        group.querySelectorAll('.no-rooms,.no-rooms-empty,.no-rooms-match').forEach(el => el.remove());
-      } else {
-        // 游戏筛选（含未知游戏）：有匹配保活房间就显示，不要求服务器当前在线
-        const hasKeptMatch = state.rooms.some(
-          r => r.server_id === s.id && roomMatchesFilterGame(r, g)
-        );
-        if (visible > 0 || hasKeptMatch) {
-          group.style.display = '';
-          if (effectiveAutoExpand && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
-          group.querySelectorAll('.no-rooms,.no-rooms-empty').forEach(el => el.style.display = 'none');
-        } else {
-          group.style.display = 'none';
-          group.querySelectorAll('.no-rooms,.no-rooms-empty').forEach(el => el.style.display = 'none');
-        }
+        m.style.display = '';
       }
-    });
-    let gm = document.getElementById('no-server-match');
-    if (!isAll && !isAllServers && document.querySelectorAll('.server-group:not([style*="display: none"])').length === 0) {
-      if (!gm) { gm = document.createElement('div'); gm.id = 'no-server-match'; gm.className = 'no-rooms'; gm.style.cssText = 'text-align:center;padding:24px;font-size:14px;'; document.getElementById('serverList').appendChild(gm); }
-      gm.textContent = `🔍 没有服务器有游戏「${g}」的房间`;
-      gm.style.display = '';
-    } else if (gm) gm.style.display = 'none';
-
-    // 不再需要 checkOverflow
-  }
+    } else if (isAll) {
+      // 总房间：有保活房间就显示（不因短暂离线/超时隐藏）
+      const hasKept = state.rooms.some(r => r.server_id === s.id);
+      const hasAny = items.length > 0 || hasKept;
+      group.style.display = hasAny ? '' : 'none';
+      if (effectiveAutoExpand && hasAny && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
+      group.querySelectorAll('.no-rooms,.no-rooms-empty,.no-rooms-match').forEach(el => el.remove());
+    } else {
+      // 游戏筛选（含未知游戏）：有匹配保活房间就显示，不要求服务器当前在线
+      const hasKeptMatch = state.rooms.some(
+        r => r.server_id === s.id && roomMatchesFilterGame(r, g)
+      );
+      if (visible > 0 || hasKeptMatch) {
+        group.style.display = '';
+        if (effectiveAutoExpand && !group.classList.contains('open')) { group.classList.add('open'); state.expanded.add(s.id); }
+        group.querySelectorAll('.no-rooms,.no-rooms-empty').forEach(el => el.style.display = 'none');
+      } else {
+        group.style.display = 'none';
+        group.querySelectorAll('.no-rooms,.no-rooms-empty').forEach(el => el.style.display = 'none');
+      }
+    }
+  });
+  let gm = document.getElementById('no-server-match');
+  if (!isAll && !isAllServers && document.querySelectorAll('.server-group:not([style*="display: none"])').length === 0) {
+    if (!gm) { gm = document.createElement('div'); gm.id = 'no-server-match'; gm.className = 'no-rooms'; gm.style.cssText = 'text-align:center;padding:24px;font-size:14px;'; document.getElementById('serverList').appendChild(gm); }
+    gm.textContent = `🔍 没有服务器有游戏「${g}」的房间`;
+    gm.style.display = '';
+  } else if (gm) gm.style.display = 'none';
+}
 
   // ===== 拖拽排序 =====
   let draggedEl = null;
