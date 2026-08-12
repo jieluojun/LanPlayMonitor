@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LAN-Play / ldn_mitm 房间监控网页（内存优化版）
+LAN-Play / ldn_mitm 房间监控网页（零第三方依赖版 · 优化版）
 """
 from __future__ import annotations
 
@@ -21,14 +21,12 @@ import time
 import uuid
 import ssl
 import socketserver
-import gc
-import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import http.client
 import urllib.request
@@ -37,28 +35,17 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================================================
-# SECTION 0 · 内存优化配置
-# ============================================================================
-
-# 减少缓存大小和TTL
-CACHE_TTL = max(3, float(os.getenv("CACHE_TTL", "3")))  # 3秒，平衡性能与内存
-CACHE_MAX_ITEMS = 64  # 减少缓存条目
-MAX_WORKERS = min(4, os.cpu_count() or 2)  # 限制线程数
-ROOM_KEEPALIVE_MISSES = 3  # 减少保活轮次
-MAX_ROOMS_PER_SERVER = 20  # 每个服务器最多保留20个房间
-LOG_MAX_ENTRIES = 150  # 减少日志条目
-UDP_SCAN_SECONDS = max(0.3, float(os.getenv("UDP_SCAN_SECONDS", "0.3")))
-
-# 启用GC调试（生产环境可注释掉）
-# gc.set_debug(gc.DEBUG_STATS)
-
-# ============================================================================
-# SECTION 1 · 日志捕获器（内存优化版）
+# SECTION 1 · 日志捕获器
 # ============================================================================
 
 class LogCapturer:
-    """日志捕获器：限制条目数量，防止内存泄漏"""
-    
+    """日志捕获器：同一种类的重复日志采用“替换”方式。
+
+    “种类”判定：把时间戳、UUID、长十六进制串、数字等易变内容归一化后，
+    剩余文本相同的日志视为同一种类。再次出现时直接替换原条目的内容和更新时间，
+    不追加新行，也不显示重复次数；条目在列表中的原位置保持不变。
+    """
+
     _RE_ISO_TS = re.compile(
         r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
     )
@@ -69,17 +56,19 @@ class LogCapturer:
     _RE_HEX = re.compile(r"\b[0-9a-f]{12,}\b", re.I)
     _RE_NUM = re.compile(r"\d+")
 
-    def __init__(self, maxlen: int = LOG_MAX_ENTRIES):
+    def __init__(self, maxlen: int = 500):
         self.terminal = sys.stdout
         self.maxlen = maxlen
+        # kind_key -> [最新原文, 首次时间, 最后更新时间]
+        # OrderedDict 的顺序代表首次出现顺序；重复日志只替换内容，不移动位置。
         self.entries: OrderedDict[str, list[Any]] = OrderedDict()
         self.lock = threading.Lock()
         self.changed = threading.Condition(self.lock)
         self.version = 0
-        self._last_cleanup = time.time()
 
     @classmethod
     def _kind_key(cls, msg: str) -> str:
+        """归一化日志为“种类”标识：剔除时间戳/UUID/哈希/数字等易变内容。"""
         key = cls._RE_ISO_TS.sub("<T>", msg)
         key = cls._RE_TIME.sub("<T>", key)
         key = cls._RE_UUID.sub("<U>", key)
@@ -100,31 +89,15 @@ class LogCapturer:
             with self.lock:
                 entry = self.entries.get(key)
                 if entry is not None:
+                    # 同种类：直接替换原条目；不追加、不计数、不改变条目位置。
                     entry[0] = msg_stripped
                     entry[2] = now
                 else:
                     self.entries[key] = [msg_stripped, now, now]
                     if len(self.entries) > self.maxlen:
-                        # 淘汰最旧的条目
-                        self.entries.popitem(last=False)
+                        self.entries.popitem(last=False)  # 淘汰最早出现的条目
                 self.version += 1
                 self.changed.notify_all()
-            
-            # 定期清理过期条目（每30秒）
-            if now - self._last_cleanup > 30:
-                self._cleanup_old_entries()
-                self._last_cleanup = now
-
-    def _cleanup_old_entries(self):
-        """清理超过10分钟的日志条目"""
-        cutoff = time.time() - 600  # 10分钟
-        with self.lock:
-            to_remove = [
-                k for k, v in self.entries.items() 
-                if v[2] < cutoff and len(self.entries) > 50
-            ]
-            for k in to_remove:
-                self.entries.pop(k, None)
 
     def flush(self):
         if self.terminal:
@@ -142,19 +115,20 @@ class LogCapturer:
         with self.lock:
             return [self._format(e) for e in self.entries.values()]
 
-    def get_logs_snapshot(self, n: int = 100) -> tuple[int, list[str]]:
+    def get_logs_snapshot(self, n: int = 200) -> tuple[int, list[str]]:
         with self.lock:
             items = [self._format(e) for e in self.entries.values()]
             return self.version, (items[-n:] if len(items) > n else items)
 
     def wait_for_change(self, version: int) -> tuple[int, list[str]]:
+        # 持续等待，只有日志版本发生变化时才返回；不设置超时。
         with self.changed:
             while self.version == version:
                 self.changed.wait()
             items = [self._format(e) for e in self.entries.values()]
-            return self.version, (items[-100:] if len(items) > 100 else items)
+            return self.version, (items[-200:] if len(items) > 200 else items)
 
-    def get_logs_tail(self, n: int = 100) -> list[str]:
+    def get_logs_tail(self, n: int = 200) -> list[str]:
         _version, items = self.get_logs_snapshot(n)
         return items
 
@@ -163,14 +137,10 @@ log_capturer = LogCapturer()
 sys.stdout = log_capturer
 sys.stderr = log_capturer
 
-info = lambda *a, **k: print("[INFO]", *a, **k)
-warn = lambda *a, **k: print("[WARN]", *a, **k)
-err = lambda *a, **k: print("[ERROR]", *a, **k)
-
-# ============================================================================
-# SECTION 2 · 原生桥接（保持原有功能）
-# ============================================================================
-
+# ============================================================
+# 原生桥接：沉浸式状态栏 + 电池优化 + 主题同步 + WebView 文件选择
+# (整合自原 android_filechooser.py，统一入口)
+# ============================================================
 try:
     import android_native
     android_native_ok = android_native.install()
@@ -195,8 +165,12 @@ _threading_battery.Thread(
     name="battery-opt-request",
 ).start()
 
+info = lambda *a, **k: print("[INFO]", *a, **k)
+warn = lambda *a, **k: print("[WARN]", *a, **k)
+err = lambda *a, **k: print("[ERROR]", *a, **k)
+
 # ============================================================================
-# SECTION 3 · 网络连通性检测（减少频率）
+# SECTION 2 · 网络连通性检测
 # ============================================================================
 
 NETWORK_CHECK_URL = "https://www.baidu.com"
@@ -219,7 +193,7 @@ def check_network_reachability() -> bool:
         headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "text/html"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=3, context=ctx_ssl) as resp:
+        with urllib.request.urlopen(req, timeout=5, context=ctx_ssl) as resp:
             return 200 <= resp.status < 600
     except (urllib.error.URLError, socket.timeout, OSError):
         return False
@@ -230,7 +204,7 @@ def get_network_status(force: bool = False) -> dict[str, Any]:
     now = time.time()
     with _network_status_lock:
         cached = _network_status_cache
-        if not force and now - cached["last_check"] < 10:  # 从5秒增加到10秒
+        if not force and now - cached["last_check"] < 5:
             return {"online": cached["online"], "last_success": cached["last_success"]}
         is_online = check_network_reachability()
         cached["last_check"] = now
@@ -240,12 +214,12 @@ def get_network_status(force: bool = False) -> dict[str, Any]:
             cached["consecutive_failures"] = 0
         else:
             cached["consecutive_failures"] += 1
-            if cached["consecutive_failures"] >= 3:
+            if cached["consecutive_failures"] >= 2:
                 cached["online"] = False
         return {"online": cached["online"], "last_success": cached["last_success"]}
 
 # ============================================================================
-# SECTION 4 · 常量 & 配置
+# SECTION 3 · 常量 & 配置
 # ============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -254,18 +228,30 @@ MANUAL_SERVERS_FILE = str(SCRIPT_DIR / "servers_manual.json")
 SERVERS_FILE = os.getenv("SERVERS_FILE", "").strip() or MANUAL_SERVERS_FILE
 DEFAULT_SERVERS_FILE = MANUAL_SERVERS_FILE
 
-REMOTE_DOWNLOAD_INTERVAL = 120  # 从60秒增加到120秒
+REMOTE_DOWNLOAD_INTERVAL = 60
 APP_NAME = "lan-play-room-monitor"
+CACHE_TTL = max(1, float(os.getenv("CACHE_TTL", "1")))
 REQUEST_TIMEOUT = max(1, float(os.getenv("REQUEST_TIMEOUT", "1")))
+MAX_WORKERS = 32
 
-# 远程资源地址
+# 可选代理前缀（为空则直连，失败自动重试直连）# 例：https://v6.gh-proxy.org 或 https://gh-proxy.com
 REMOTE_UPDATE_PROXY = os.getenv("REMOTE_UPDATE_PROXY", "https://v6.gh-proxy.org").strip().rstrip("/")
+# 远程资源原始地址（直连）；实际请求时若 REMOTE_UPDATE_PROXY 非空则优先走 代理/原始URL
 REMOTE_CHINESE_DB_URL = "https://raw.githubusercontent.com/jieluojun/LanPlayMonitor/refs/heads/main/chinese_db.json"
 REMOTE_SERVERS_URL = "https://raw.githubusercontent.com/jieluojun/LanPlayMonitor/refs/heads/main/servers.json"
+
+# 前后端远程更新地址（同上，直连原始地址）
 REMOTE_FRONTEND_URL = "https://raw.githubusercontent.com/jieluojun/LanPlayMonitor/refs/heads/main/script.js"
 REMOTE_BACKEND_URL = "https://raw.githubusercontent.com/jieluojun/LanPlayMonitor/refs/heads/main/main.py"
 LOCAL_FRONTEND_FILE = str(SCRIPT_DIR / "script.js")
 LOCAL_BACKEND_FILE = str(SCRIPT_DIR / "main.py")
+
+def _remote_candidate_urls(url: str) -> list[str]:
+    """根据 REMOTE_UPDATE_PROXY 生成候选 URL 列表：优先代理，失败自动重试直连。"""
+    if REMOTE_UPDATE_PROXY:
+        return [f"{REMOTE_UPDATE_PROXY}/{url}", url]
+    return [url]
+
 LOCAL_CHINESE_DB_FILE = str(SCRIPT_DIR / "chinese_db.json")
 
 DEFAULT_SERVERS: list[dict[str, Any]] = [
@@ -284,14 +270,15 @@ BUILTIN_GAME_TITLES: dict[str, str] = {
 }
 
 # ============================================================================
-# SECTION 5 · Cloudflare R2 存储（保持原有功能，仅添加内存优化）
+# SECTION 3.5 · Cloudflare R2 存储（聊天媒体上传）
 # ============================================================================
 
 import hashlib
 import hmac
 import mimetypes
 
-# 从环境变量读取配置
+# 不再内置任何 GoEasy / R2 账号、密钥、桶名、域名或容量值。
+# 仅从环境变量或 env.json 读取；未配置时保持为空并禁用对应功能。
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -306,19 +293,16 @@ try:
 except (TypeError, ValueError):
     R2_MAX_STORAGE_MB = 0
 
+# Cloudflare API Token（可选，仅从外部配置读取）
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 
+# 内置下载器：Android 默认公共下载目录，可通过 DOWNLOAD_DIR 覆盖
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/storage/emulated/0/Download")).expanduser()
-DOWNLOAD_MAX_MB = int(os.getenv("DOWNLOAD_MAX_MB", "2048"))
+DOWNLOAD_MAX_MB = int(os.getenv("DOWNLOAD_MAX_MB", "2048"))  # 内置下载最大容量（单位：MB，默认 2GB）
 DOWNLOAD_MAX_BYTES = DOWNLOAD_MAX_MB * 1024 * 1024
-DOWNLOAD_TIMEOUT = max(10, float(os.getenv("DOWNLOAD_TIMEOUT", "180")))  # 从300秒减少到180秒
+DOWNLOAD_TIMEOUT = max(10, float(os.getenv("DOWNLOAD_TIMEOUT", "300")))
 DOWNLOAD_XOR_KEY = 0x5A
 _download_path_lock = threading.Lock()
-
-# R2头像查询缓存（减少重复请求）
-_avatar_cache: dict[str, tuple[str, float]] = {}
-_avatar_cache_lock = threading.Lock()
-_AVATAR_CACHE_TTL = 300  # 5分钟
 
 
 def _cos_guess_file_type(filename: str, content_type: str) -> str:
@@ -334,13 +318,16 @@ def _cos_guess_file_type(filename: str, content_type: str) -> str:
 
 
 def _cos_safe_filename(name: str) -> str:
+    """生成 R2 安全文件名：保留中文、字母、数字、点、短横、下划线、空格用下划线替换。"""
     base = Path(name or "file").name
+    # 替换空格为下划线，移除路径不安全字符（保留中文、日文、韩文等 CJK、字母数字点短横下划线）
     base = base.replace(" ", "_")
     base = re.sub(r"[^\w.\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\-]+", "", base, flags=re.UNICODE)
     return (base[:120] or "file")
 
 
 def _download_filename_from_headers(headers: Any) -> str:
+    """从 Content-Disposition 中读取下载文件名，兼容 filename*。"""
     value = str(headers.get("Content-Disposition", "") or "")
     match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", value, re.I)
     if match:
@@ -353,6 +340,7 @@ def _download_filename_from_headers(headers: Any) -> str:
 
 
 def _download_unique_path(directory: Path, filename: str) -> Path:
+    """在下载目录中生成不覆盖旧文件的目标路径。"""
     safe_name = _cos_safe_filename(filename or "download")
     stem = Path(safe_name).stem or "download"
     suffix = Path(safe_name).suffix
@@ -366,6 +354,11 @@ def _download_unique_path(directory: Path, filename: str) -> Path:
 
 
 def download_url_to_android(url: str, filename: str = "", xor: bool = False) -> dict[str, Any]:
+    """将远程文件流式下载到 Android 公共 Download 目录。
+
+    xor=True 用于下载上传时为绕过 R2 检测而 XOR 加密的文件，并在写入本地时还原。
+    不把整个文件读入内存，适合视频、大文件和安装包。
+    """
     parsed = urllib.parse.urlparse(str(url or "").strip())
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("只支持 http/https 文件地址")
@@ -449,6 +442,10 @@ def download_url_to_android(url: str, filename: str = "", xor: bool = False) -> 
 
 def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: str = "",
                           xor: bool = False, mime_hint: str = "") -> None:
+    """把远程文件流式转发给当前浏览器下载，不写入服务端 Android Download 目录。
+
+    公网模式使用该响应；xor=True 时边转发边还原 .dlp 内容，避免把大文件整体读入内存。
+    """
     parsed = urllib.parse.urlparse(str(url or "").strip())
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("只支持 http/https 文件地址")
@@ -479,6 +476,7 @@ def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: s
             raise ValueError(f"文件过大，最大允许 {DOWNLOAD_MAX_BYTES // (1024 * 1024)}MB")
 
         content_type = str(mime_hint or resp.headers.get("Content-Type", "application/octet-stream") or "application/octet-stream")
+        # 防止响应头注入；只接受常规 MIME 形式。
         if not re.fullmatch(r"[A-Za-z0-9.+_-]+/[A-Za-z0-9.+_-]+(?:\s*;\s*charset=[A-Za-z0-9._-]+)?", content_type):
             content_type = "application/octet-stream"
 
@@ -519,15 +517,18 @@ def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: s
 def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
                        params: dict[str, str] | None = None,
                        data: bytes = b"") -> tuple[str, str]:
+    """Cloudflare R2 AWS Signature V4（零第三方依赖）。"""
     params = params or {}
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = now.strftime("%Y%m%d")
     
+    # R2 Endpoint
     host = f"{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     region = "auto"
     service = "s3"
     
+    # Canonical Request
     canonical_uri = "/" + object_key.lstrip("/")
     canonical_querystring = "&".join(
         f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(str(params[k]), safe='')}"
@@ -565,6 +566,7 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
         f"{hashed_canonical_request}"
     )
     
+    # Signing Key
     def _sign(key: bytes, msg: str) -> bytes:
         return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
     
@@ -586,8 +588,9 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
 
 
 def r2_put_object(data: bytes, object_key: str, content_type: str = "application/octet-stream") -> str:
+    """上传对象到 R2，返回公共 URL。"""
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
-        raise RuntimeError("R2 未配置")
+        raise RuntimeError("R2 未配置，请设置环境变量 R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME")
     
     object_key = object_key.lstrip("/")
     host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -622,6 +625,7 @@ def r2_put_object(data: bytes, object_key: str, content_type: str = "application
 
 
 def r2_public_object_url(object_key: str, version: str = "") -> str:
+    """生成对象公共 URL；version 用于覆盖同名头像后的浏览器缓存刷新。"""
     clean_key = str(object_key or "").lstrip("/")
     if R2_PUBLIC_URL:
         url = f"{R2_PUBLIC_URL.rstrip('/')}/{clean_key}"
@@ -633,6 +637,7 @@ def r2_public_object_url(object_key: str, version: str = "") -> str:
 
 
 def avatar_object_key(user_id: str, extension: str = ".png") -> str:
+    """使用用户 ID 哈希生成稳定对象键：同一 ID 重装/异地登录仍指向同一头像。"""
     uid = str(user_id or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{2,64}", uid):
         raise ValueError("用户 ID 格式无效")
@@ -644,6 +649,7 @@ def avatar_object_key(user_id: str, extension: str = ".png") -> str:
 
 
 def r2_head_object(object_key: str) -> dict[str, Any]:
+    """通过签名 HEAD 判断 R2 对象是否存在，并返回 ETag 作为缓存版本。"""
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
         return {"exists": False, "etag": ""}
     clean_key = str(object_key or "").lstrip("/")
@@ -670,46 +676,18 @@ def r2_head_object(object_key: str) -> dict[str, Any]:
 
 
 def find_r2_avatar(user_id: str) -> dict[str, Any]:
-    """查找用户头像（带缓存）"""
-    cache_key = str(user_id or "").strip()
-    if not cache_key:
-        return {"exists": False, "object_key": "", "url": ""}
-    
-    # 检查缓存
-    with _avatar_cache_lock:
-        if cache_key in _avatar_cache:
-            url, expires = _avatar_cache[cache_key]
-            if time.time() < expires:
-                return {"exists": True, "object_key": "", "url": url}
-            else:
-                del _avatar_cache[cache_key]
-    
+    """查找用户稳定头像对象；兼容未来格式及当前 PNG/JPEG/WebP。"""
     for ext in (".png", ".jpg", ".webp"):
         key = avatar_object_key(user_id, ext)
         meta = r2_head_object(key)
         if meta.get("exists"):
             version = str(meta.get("etag") or "")[:24]
-            url = r2_public_object_url(key, version)
-            # 缓存结果
-            with _avatar_cache_lock:
-                _avatar_cache[cache_key] = (url, time.time() + _AVATAR_CACHE_TTL)
-            return {"exists": True, "object_key": key, "url": url}
-    
-    # 缓存空结果（短时间）
-    with _avatar_cache_lock:
-        _avatar_cache[cache_key] = ("", time.time() + 60)
+            return {"exists": True, "object_key": key, "url": r2_public_object_url(key, version)}
     return {"exists": False, "object_key": "", "url": ""}
 
 
 def get_r2_bucket_total_size() -> int:
-    """获取R2桶总大小（带缓存）"""
-    cache_key = "_r2_bucket_size"
-    with _avatar_cache_lock:
-        if cache_key in _avatar_cache:
-            size, expires = _avatar_cache[cache_key]
-            if time.time() < expires:
-                return int(size)
-    
+    """通过 R2 S3 ListObjectsV2 计算当前桶总大小（字节）。"""
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
         return 0
     host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -718,7 +696,6 @@ def get_r2_bucket_total_size() -> int:
     ctx_ssl = ssl.create_default_context()
     ctx_ssl.check_hostname = False
     ctx_ssl.verify_mode = ssl.CERT_NONE
-    count = 0
     while True:
         params = {"list-type": "2", "max-keys": "1000"}
         if continuation:
@@ -745,6 +722,7 @@ def get_r2_bucket_total_size() -> int:
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(xml_data)
+            # 去除 XML 命名空间，兼容 S3/R2 列表响应
             for elem in root.iter():
                 if isinstance(elem.tag, str) and '}' in elem.tag:
                     elem.tag = elem.tag.split('}', 1)[1]
@@ -753,26 +731,57 @@ def get_r2_bucket_total_size() -> int:
                 if size_el is not None and size_el.text:
                     try:
                         total += int(size_el.text)
-                        count += 1
                     except ValueError:
                         pass
             truncated_el = root.find("IsTruncated")
             is_truncated = truncated_el is not None and truncated_el.text == "true"
             next_token_el = root.find("NextContinuationToken")
             continuation = (next_token_el.text or "") if (next_token_el is not None and next_token_el.text) else ""
-            if not is_truncated or count > 5000:  # 限制最大扫描数量
+            if not is_truncated:
                 break
         except Exception as exc:
             err(f"[R2] XML 解析失败: {exc}")
             break
-    
-    # 缓存结果（60秒）
-    with _avatar_cache_lock:
-        _avatar_cache[cache_key] = (str(total), time.time() + 60)
     return total
 
 
+def disable_r2_public_access() -> bool:
+    """调用 Cloudflare API 关闭 R2 公开访问（managed r2.dev）。"""
+    token = os.getenv("CF_API_TOKEN", CF_API_TOKEN).strip()
+    if not token:
+        warn("[CF API] 缺少 CF_API_TOKEN，无法自动关闭公共访问")
+        return False
+    account_id = R2_ACCOUNT_ID
+    bucket = R2_BUCKET_NAME
+    if not account_id or not bucket:
+        warn("[CF API] R2_ACCOUNT_ID 或 R2_BUCKET_NAME 为空，无法调用 API")
+        return False
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/domains/managed"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({"enabled": False}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="PUT", headers=headers)
+    ctx_ssl = ssl.create_default_context()
+    ctx_ssl.check_hostname = False
+    ctx_ssl.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx_ssl) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            info(f"[CF API] 关闭公共访问成功 HTTP {resp.status}: {body[:200]}")
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+        err(f"[CF API] 关闭公共访问失败 HTTP {e.code}: {body[:300]}")
+        return False
+    except Exception as exc:
+        err(f"[CF API] 关闭公共访问异常: {exc}")
+        return False
+
+
 def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
+    """清理 R2 存储桶；默认永久保留 avatars/ 下的用户头像。"""
     warn("[R2] ⚠️ 执行存储桶清理" + ("（保留用户头像）" if preserve_avatars else "（删除全部对象）"))
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
         err("[R2] 清空存储桶失败：R2 未配置")
@@ -783,7 +792,6 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
     ctx_ssl = ssl.create_default_context()
     ctx_ssl.check_hostname = False
     ctx_ssl.verify_mode = ssl.CERT_NONE
-    count = 0
     while True:
         params = {"list-type": "2", "max-keys": "1000"}
         if continuation:
@@ -817,12 +825,11 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
                 key_el = contents.find("Key")
                 if key_el is not None and key_el.text:
                     keys.append(key_el.text)
-                    count += 1
             truncated_el = root.find("IsTruncated")
             is_truncated = truncated_el is not None and truncated_el.text == "true"
             next_token_el = root.find("NextContinuationToken")
             continuation = (next_token_el.text or "") if (next_token_el is not None and next_token_el.text) else ""
-            if not is_truncated or count > 5000:
+            if not is_truncated:
                 break
         except Exception as exc:
             err(f"[R2] 清空存储桶 - XML 解析失败: {exc}")
@@ -853,8 +860,11 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
 
 
 def check_r2_bucket_capacity(source: str = "检查") -> int:
-    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME
-            and R2_MAX_STORAGE_MB > 0):
+    """检查 R2 桶容量：记录当前大小与剩余空间；达上限则清理聊天媒体并保留头像。"""
+    if not (
+        R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME
+        and R2_MAX_STORAGE_MB > 0
+    ):
         return 0
     try:
         sz = get_r2_bucket_total_size()
@@ -874,6 +884,7 @@ def check_r2_bucket_capacity(source: str = "检查") -> int:
 
 
 def parse_multipart(body: bytes, content_type: str) -> list[dict[str, Any]]:
+    """简易 multipart/form-data 解析，返回 parts: name/filename/content_type/data。"""
     m = re.search(r"boundary=([^;]+)", content_type or "", re.I)
     if not m:
         raise ValueError("缺少 multipart boundary")
@@ -908,6 +919,7 @@ def parse_multipart(body: bytes, content_type: str) -> list[dict[str, Any]]:
             if line.lower().startswith("content-disposition:"):
                 nm = re.search(r'name="([^"]*)"', line)
                 fn = re.search(r'filename="([^"]*)"', line)
+                # RFC 5987: filename*=UTF-8''encoded_name
                 fn_star = re.search(r"filename\*=?UTF-8''([^\";\s]+)", line, re.I) if not fn else None
                 if nm:
                     name = nm.group(1)
@@ -925,12 +937,17 @@ def parse_multipart(body: bytes, content_type: str) -> list[dict[str, Any]]:
         })
     return parts
 
+
 # ============================================================================
-# SECTION 6 · 环境变量配置（保持原有功能）
+# SECTION 3.6 · 环境变量配置（env.json 可视化编辑）
+# 将 GoEasy（聊天）与 Cloudflare R2（存储桶）两类配置分开保存到一个
+# JSON 文件里；若文件不存在会自动创建。保存 R2 配置后会即时应用到运行时。
+# 安全密码（加盐哈希）也一并保存在 env.json 的 security 字段中。
 # ============================================================================
 
 ENV_CONFIG_FILE = str(SCRIPT_DIR / "env.json")
 
+# 默认配置不含任何服务值；可通过环境变量预置，或在网页设置中手动填写。
 DEFAULT_ENV_CONFIG: dict[str, Any] = {
     "goeasy": {
         "appkey": os.getenv("GOEASY_APPKEY", "").strip(),
@@ -947,7 +964,7 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
         "max_storage_mb": R2_MAX_STORAGE_MB if R2_MAX_STORAGE_MB > 0 else "",
         "cf_api_token": CF_API_TOKEN,
     },
-    "security": {                           # 新增
+    "security": {                           # 新增：存储密码哈希
         "password_hash": "",
         "salt": "",
         "set_at": 0.0,
@@ -956,6 +973,7 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
 
 
 def ensure_env_config() -> str:
+    """若 env.json 不存在则用默认值自动创建，返回文件路径。"""
     p = Path(ENV_CONFIG_FILE)
     if p.is_file():
         return ENV_CONFIG_FILE
@@ -964,24 +982,30 @@ def ensure_env_config() -> str:
             json.dumps(DEFAULT_ENV_CONFIG, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        info(f"[env配置] 已自动创建: {ENV_CONFIG_FILE}")
+        info(f"[env配置] 未检测到环境变量配置文件，已自动创建: {ENV_CONFIG_FILE}")
     except Exception as exc:
-        err(f"[env配置] 自动创建失败: {exc}")
+        err(f"[env配置] 自动创建配置文件失败: {exc}")
     return ENV_CONFIG_FILE
 
 
 def load_env_config() -> dict[str, Any]:
+    """读取环境变量配置；文件缺失时自动创建。"""
     ensure_env_config()
     try:
         data = json.loads(Path(ENV_CONFIG_FILE).read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
+        warn("[env配置] 配置文件格式不是对象，使用默认值")
     except Exception as exc:
-        err(f"[env配置] 读取失败: {exc}")
+        err(f"[env配置] 读取配置文件失败: {exc}")
     return copy.deepcopy(DEFAULT_ENV_CONFIG)
 
 
 def _build_runtime_env_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """聊天启动所需的最小公开配置（不含 R2 密钥等敏感字段）。
+
+    GoEasy appkey 属于客户端 SDK 密钥，聊天功能必须下发；完整 env 仍受密码保护。
+    """
     src = cfg if isinstance(cfg, dict) else {}
     go = src.get("goeasy") if isinstance(src.get("goeasy"), dict) else {}
     r2 = src.get("cloudflare_r2") if isinstance(src.get("cloudflare_r2"), dict) else {}
@@ -999,6 +1023,7 @@ def _build_runtime_env_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_r2_config_to_runtime(cfg: dict[str, Any]) -> None:
+    """把 cloudflare_r2 配置即时应用到运行时的全局变量（上传接口立即生效）。"""
     global R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, \
         R2_BUCKET_NAME, R2_PUBLIC_URL, R2_MAX_UPLOAD_MB, R2_MAX_STORAGE_MB, \
         CF_API_TOKEN
@@ -1022,7 +1047,9 @@ def apply_r2_config_to_runtime(cfg: dict[str, Any]) -> None:
 
 
 def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
+    """合并并保存环境变量配置（支持任意顶层键，包括 security），随后把 R2 配置应用到运行时。"""
     ensure_env_config()
+    # 读取现有配置
     try:
         existing = json.loads(Path(ENV_CONFIG_FILE).read_text(encoding="utf-8"))
         if not isinstance(existing, dict):
@@ -1030,12 +1057,14 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         existing = {}
 
+    # 深度合并传入的数据（递归合并字典，其他类型直接覆盖）
     for key, value in data.items():
         if isinstance(value, dict) and key in existing and isinstance(existing[key], dict):
             existing[key].update(value)
         else:
             existing[key] = value
 
+    # 确保必要 section 存在
     for section in ("goeasy", "cloudflare_r2", "security"):
         if section not in existing:
             existing[section] = {}
@@ -1043,47 +1072,53 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     Path(ENV_CONFIG_FILE).write_text(
         json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
+    # 应用 R2 配置
     if "cloudflare_r2" in existing:
         apply_r2_config_to_runtime(existing)
 
-    info(f"[env配置] 已保存: {ENV_CONFIG_FILE}")
+    info(f"[env配置] 环境变量配置已保存并应用: {ENV_CONFIG_FILE}")
     return existing
 
+
 # ============================================================================
-# SECTION 7 · 环境变量安全配置
+# SECTION 3.7 · 环境变量配置安全（公网强制密码 + 局域网跳过）
+# 安全密码（加盐哈希）保存在 env.json 的 security 字段中；一旦设置，
+# 之后无论局域网/公网修改配置都需输入正确密码。
 # ============================================================================
 
-# 注意：SECURITY_FILE 常量已移除，密码存储在 env.json 的 security 字段中。
+# 注意：不再使用独立的 SECURITY_FILE 常量，所有数据存于 env.json 的 security 字段。
 
+# 局域网/保留地址段一律视为「非公网」
 _PRIVATE_NETWORKS = (
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),      # loopback
+    ipaddress.ip_network("::1/128"),          # IPv6 loopback
+    ipaddress.ip_network("10.0.0.0/8"),       # 私网 A 类
+    ipaddress.ip_network("172.16.0.0/12"),    # 私网 B 类
+    ipaddress.ip_network("192.168.0.0/16"),   # 私网 C 类
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local
+    ipaddress.ip_network("fc00::/7"),         # IPv6 唯一本地
+    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
+    ipaddress.ip_network("0.0.0.0/8"),        # 本网络
+    ipaddress.ip_network("100.64.0.0/10"),    # CGNAT 运营商 NAT
 )
 
 
 def is_lan_ip(client_ip: str) -> bool:
+    """判断来源 IP 是否属于局域网/本机（含 localhost）；无法解析时视为安全。"""
     if not client_ip:
         return True
     s = str(client_ip).strip().lower()
+    # 去除 IPv6 端口/方括号
     if s.startswith("["):
         s = s[1:].split("]")[0]
-    if "%" in s:
+    if "%" in s:            # IPv6 zone id
         s = s.split("%")[0]
     if s in ("localhost", "::1"):
         return True
     try:
         addr = ipaddress.ip_address(s)
     except ValueError:
-        return True
+        return True  # 非 IP（如主机名）视为安全
     if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved or addr.is_multicast:
         return True
     for net in _PRIVATE_NETWORKS:
@@ -1093,9 +1128,11 @@ def is_lan_ip(client_ip: str) -> bool:
 
 
 def _normalize_request_ip(value: Any) -> str:
+    """从代理头/连接信息中提取一个可解析的纯 IP（兼容引号、IPv6 方括号和端口）。"""
     raw = str(value or "").strip().strip('"').strip("'")
     if not raw:
         return ""
+    # RFC 7239: for=1.2.3.4 / for="[2001:db8::1]:1234"
     if raw.lower().startswith("for="):
         raw = raw[4:].strip().strip('"').strip("'")
     if raw.startswith("[") and "]" in raw:
@@ -1113,6 +1150,11 @@ def _normalize_request_ip(value: Any) -> str:
 
 
 def get_request_client_ip(handler: Any) -> str:
+    """获取真实客户端 IP。
+
+    直连来源是公网时永远优先使用连接 IP，防止伪造转发头把公网请求冒充成局域网；
+    只有连接来自本机/局域网反向代理时，才读取 Cloudflare/X-Forwarded-* 等头。
+    """
     peer = ""
     try:
         peer = _normalize_request_ip(handler.client_address[0] if handler.client_address else "")
@@ -1128,6 +1170,7 @@ def get_request_client_ip(handler: Any) -> str:
             value = headers.get(key, "")
             if value:
                 candidates.append(value)
+        # 标准 XFF 左侧为原始客户端；逐个检查以兼容多级代理。
         xff = headers.get("X-Forwarded-For", "")
         if xff:
             candidates.extend(part.strip() for part in xff.split(","))
@@ -1153,12 +1196,14 @@ def get_request_client_ip(handler: Any) -> str:
 
 
 def _request_host_name(handler: Any) -> str:
+    """提取访问 Host，作为未传递真实 IP 的反向代理场景兜底。"""
     try:
         raw = str(handler.headers.get("X-Forwarded-Host", "") or handler.headers.get("Host", "")).split(",", 1)[0].strip()
     except Exception:
         return ""
     if not raw:
         return ""
+    # urlsplit 能正确处理 [IPv6]:port；无 scheme 时补 //。
     try:
         return (urllib.parse.urlsplit("//" + raw).hostname or "").strip().lower()
     except Exception:
@@ -1166,10 +1211,13 @@ def _request_host_name(handler: Any) -> str:
 
 
 def is_public_request(handler: Any) -> tuple[bool, str]:
+    """判断本次页面访问是否来自公网，返回 (is_public, effective_client_ip)。"""
     client_ip = get_request_client_ip(handler)
     if client_ip and not is_lan_ip(client_ip):
         return True, client_ip
 
+    # 直连的私网来源明确属于局域网。只有连接来自本机反向代理（常见于公网隧道）
+    # 或拿不到连接 IP 时，才依据 Host 兜底，避免局域网自定义域名被误判为公网。
     peer_ip = ""
     try:
         peer_ip = _normalize_request_ip(handler.client_address[0] if handler.client_address else "")
@@ -1178,6 +1226,7 @@ def is_public_request(handler: Any) -> tuple[bool, str]:
     except Exception:
         pass
 
+    # 本机反向代理若未传真实 IP，可依据访问域名兜底：本机/私网 Host 为局域网，其它域名为公网。
     host = _request_host_name(handler)
     if not host or host == "localhost" or host.endswith(".local") or host.endswith(".lan"):
         return False, client_ip
@@ -1185,6 +1234,7 @@ def is_public_request(handler: Any) -> tuple[bool, str]:
         addr = ipaddress.ip_address(host)
         return (not is_lan_ip(str(addr))), client_ip
     except ValueError:
+        # 含点的普通域名按公网入口处理；Android 内置短主机名仍视为局域网。
         return ("." in host), client_ip
 
 
@@ -1193,6 +1243,7 @@ def _hash_password(password: str, salt: str) -> str:
 
 
 def load_security() -> dict[str, Any]:
+    """从 env.json 读取 security 配置"""
     cfg = load_env_config()
     sec = cfg.get("security") if isinstance(cfg.get("security"), dict) else {}
     sec.setdefault("password_hash", "")
@@ -1206,6 +1257,7 @@ def is_password_set() -> bool:
 
 
 def verify_password(password: Any) -> bool:
+    """校验密码；未设置密码时恒为通过。"""
     sec = load_security()
     h = sec.get("password_hash")
     if not h:
@@ -1215,6 +1267,7 @@ def verify_password(password: Any) -> bool:
 
 
 def set_security_password(password: str) -> bool:
+    """设置/修改安全密码（存入 env.json 的 security 字段）。"""
     if not password or len(password) < 4:
         raise ValueError("安全密码长度至少为 4 位")
     salt = secrets.token_hex(16)
@@ -1227,7 +1280,7 @@ def set_security_password(password: str) -> bool:
         "set_at": time.time(),
     }
     save_env_config(cfg)
-    info(f"[安全] 密码已保存至 {ENV_CONFIG_FILE}")
+    info(f"[安全] 环境变量配置安全密码已保存至 {ENV_CONFIG_FILE}")
     return True
 
 
@@ -1262,7 +1315,7 @@ def _download_remote_file(url: str, dest_path: str) -> bool:
                     info(f"[远程下载] 经代理成功 {cand_url}")
                 return True
         except Exception as exc:
-            warn(f"[远程下载] 失败 {cand_url}: {exc}")
+            warn(f"[远程下载] 下载失败 {cand_url} -> {dest_path}: {exc}")
             continue
     try:
         if os.path.exists(tmp_path):
@@ -1302,19 +1355,12 @@ def remote_download_worker():
         time.sleep(REMOTE_DOWNLOAD_INTERVAL)
 
 
-def _remote_candidate_urls(url: str) -> list[str]:
-    if REMOTE_UPDATE_PROXY:
-        return [f"{REMOTE_UPDATE_PROXY}/{url}", url]
-    return [url]
-
-
 # ============================================================================
-# SECTION 9 · 前后端远程更新
+# SECTION 4.5 · 前后端远程更新（哈希对比手动更新 + 启动时前端缺失自动下载）
 # ============================================================================
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
 
 def _sha256_file(path: Path) -> str | None:
     try:
@@ -1323,7 +1369,6 @@ def _sha256_file(path: Path) -> str | None:
         return _sha256_bytes(path.read_bytes())
     except Exception:
         return None
-
 
 def _fetch_remote_bytes(url: str, timeout: float = 15) -> bytes | None:
     urls = _remote_candidate_urls(url)
@@ -1337,10 +1382,9 @@ def _fetch_remote_bytes(url: str, timeout: float = 15) -> bytes | None:
                 if 200 <= resp.status < 300:
                     return resp.read()
         except Exception as e:
-            warn(f"[更新] 拉取失败 {u}: {e}")
+            warn(f"[更新] 拉取远程失败 {u}: {e}")
             continue
     return None
-
 
 def ensure_frontend_exists() -> None:
     fp = Path(LOCAL_FRONTEND_FILE)
@@ -1353,12 +1397,11 @@ def ensure_frontend_exists() -> None:
             tmp = str(fp) + f".tmp.{uuid.uuid4().hex[:6]}"
             Path(tmp).write_bytes(data)
             os.replace(tmp, str(fp))
-            info(f"[更新] ✅ 前端已自动下载 {len(data)} bytes")
+            info(f"[更新] ✅ 前端已自动下载 {len(data)} bytes hash={_sha256_bytes(data)[:8]}")
         except Exception as e:
-            err(f"[更新] 前端写入失败: {e}")
+            err(f"[更新] 前端自动下载写入失败: {e}")
     else:
-        warn("[更新] 前端自动下载失败")
-
+        warn("[更新] 前端自动下载失败（远程无数据）")
 
 def check_update_status() -> dict[str, Any]:
     frontend_local = _sha256_file(Path(LOCAL_FRONTEND_FILE))
@@ -1367,6 +1410,7 @@ def check_update_status() -> dict[str, Any]:
     be_data = _fetch_remote_bytes(REMOTE_BACKEND_URL)
     backend_local = _sha256_file(Path(LOCAL_BACKEND_FILE))
     backend_remote = _sha256_bytes(be_data) if be_data else None
+    backend_need = bool(backend_remote and backend_local != backend_remote)
     return {
         "frontend": {
             "local_hash": frontend_local,
@@ -1378,12 +1422,11 @@ def check_update_status() -> dict[str, Any]:
         "backend": {
             "local_hash": backend_local,
             "remote_hash": backend_remote,
-            "need_update": bool(backend_remote and backend_local != backend_remote),
+            "need_update": backend_need,
             "remote_available": backend_remote is not None,
             "mode": "py",
         },
     }
-
 
 def do_update_frontend() -> dict[str, Any]:
     fp = Path(LOCAL_FRONTEND_FILE)
@@ -1393,15 +1436,15 @@ def do_update_frontend() -> dict[str, Any]:
         return {"ok": False, "error": "远程前端获取失败", "skipped": False}
     remote_hash = _sha256_bytes(data)
     if local_hash == remote_hash:
-        return {"ok": True, "skipped": True, "message": "前端已是最新"}
+        return {"ok": True, "skipped": True, "message": "前端已是最新，无需更新", "local_hash": local_hash, "remote_hash": remote_hash}
     try:
         tmp = str(fp) + f".tmp.{uuid.uuid4().hex[:6]}"
         Path(tmp).write_bytes(data)
         os.replace(tmp, str(fp))
-        return {"ok": True, "skipped": False, "message": "前端更新完成请重启应用"}
+        info(f"[更新] ✅ 前端已更新 {local_hash[:8] if local_hash else 'none'} -> {remote_hash[:8]}")
+        return {"ok": True, "skipped": False, "message": "前端更新完成请重启应用", "local_hash": local_hash, "remote_hash": remote_hash}
     except Exception as e:
         return {"ok": False, "error": str(e), "skipped": False}
-
 
 def do_update_backend() -> dict[str, Any]:
     fp = Path(LOCAL_BACKEND_FILE)
@@ -1411,15 +1454,21 @@ def do_update_backend() -> dict[str, Any]:
     local_hash = _sha256_file(fp)
     remote_hash = _sha256_bytes(data)
     if local_hash == remote_hash:
-        return {"ok": True, "skipped": True, "message": "后端已是最新", "mode": "py"}
+        return {"ok": True, "skipped": True, "message": "后端已是最新，无需更新", "local_hash": local_hash, "remote_hash": remote_hash, "mode": "py"}
     try:
-        tmp = str(fp) + f".tmp.{uuid.uuid4().hex[:6]}"
-        Path(tmp).write_bytes(data)
-        os.replace(tmp, str(fp))
-        return {"ok": True, "skipped": False, "message": "后端更新完成请重启应用", "mode": "py"}
+        try:
+            tmp = str(fp) + f".tmp.{uuid.uuid4().hex[:6]}"
+            Path(tmp).write_bytes(data)
+            os.replace(tmp, str(fp))
+        except Exception:
+            if not fp.is_file():
+                tmp = str(fp) + f".tmp.{uuid.uuid4().hex[:6]}"
+                Path(tmp).write_bytes(data)
+                os.replace(tmp, str(fp))
+        info(f"[更新] ✅ 后端已更新 {local_hash[:8] if local_hash else 'none'} -> {remote_hash[:8]} [py]")
+        return {"ok": True, "skipped": False, "message": "后端更新完成请重启应用", "local_hash": local_hash, "remote_hash": remote_hash, "mode": "py"}
     except Exception as e:
         return {"ok": False, "error": str(e), "skipped": False}
-
 
 def start_remote_download_thread():
     def _first_then_loop():
@@ -1448,18 +1497,20 @@ def start_remote_download_thread():
 
     t = threading.Thread(target=_first_then_loop, daemon=True, name="remote-downloader")
     t.start()
-    info(f"[远程下载] 后台线程已启动，间隔 {REMOTE_DOWNLOAD_INTERVAL} 秒")
+    info(f"[远程下载] 后台下载线程已启动，间隔 {REMOTE_DOWNLOAD_INTERVAL} 秒")
 
 # ============================================================================
-# SECTION 10 · 标题映射加载
+# SECTION 5 · 标题映射加载
 # ============================================================================
 
+# 标题映射加载结果缓存：避免每秒轮询 refresh_config 时重复刷日志
 _game_titles_cache: dict[str, str] | None = None
 _game_titles_mtime: float | None = None
 _game_titles_logged_sig: str = ""
 
 
 def load_game_titles() -> dict[str, str]:
+    """加载标题映射；仅在文件变更或首次加载时写日志，避免跟随轮询重复叠加。"""
     global _game_titles_cache, _game_titles_mtime, _game_titles_logged_sig
     local_path = Path(LOCAL_CHINESE_DB_FILE)
     mtime: float | None = None
@@ -1490,13 +1541,14 @@ def load_game_titles() -> dict[str, str]:
                     merged[str(k).upper()] = str(v)
             sig = f"file:{len(data)}:{len(merged)}"
             if sig != _game_titles_logged_sig:
-                info(f"[配置] 标题映射已加载: {len(data)} 条，合并后: {len(merged)}")
+                info(f"[配置] 标题映射已加载: {len(data)} 条，合并后总数: {len(merged)}")
                 _game_titles_logged_sig = sig
             _game_titles_cache = dict(merged)
             _game_titles_mtime = mtime
             return merged
+        warn("[配置警告] 本地标题映射格式不正确")
     except Exception as exc:
-        warn(f"[配置警告] 读取标题映射失败: {exc}")
+        warn(f"[配置警告] 读取本地标题映射失败（{exc}）")
     sig = f"builtin-fallback:{len(merged)}"
     if sig != _game_titles_logged_sig:
         info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
@@ -1506,7 +1558,7 @@ def load_game_titles() -> dict[str, str]:
     return merged
 
 # ============================================================================
-# SECTION 11 · TTL缓存（内存优化版）
+# SECTION 6 · TTL 缓存
 # ============================================================================
 
 @dataclass
@@ -1516,12 +1568,10 @@ class CacheItem:
 
 
 class TTLCache:
-    def __init__(self, max_items: int = CACHE_MAX_ITEMS):
+    def __init__(self, max_items: int = 1024):
         self._items: dict[str, CacheItem] = {}
         self._lock = threading.Lock()
         self.max_items = max_items
-        self._cleanup_counter = 0
-        self._last_cleanup = time.time()
 
     def get(self, key: str) -> Any | None:
         now = time.monotonic()
@@ -1538,42 +1588,28 @@ class TTLCache:
         with self._lock:
             self._items[key] = CacheItem(copy.deepcopy(value), time.monotonic() + ttl)
             if len(self._items) > self.max_items:
-                # 删除最旧的条目
                 oldest_key = next(iter(self._items))
                 self._items.pop(oldest_key, None)
-        
-        # 定期清理过期条目
-        now = time.time()
-        if now - self._last_cleanup > 30:
-            self._cleanup_expired()
-            self._last_cleanup = now
-
-    def _cleanup_expired(self):
-        now = time.monotonic()
-        with self._lock:
-            expired = [k for k, v in self._items.items() if v.expires_at <= now]
-            for k in expired:
-                self._items.pop(k, None)
 
     def clear(self):
         with self._lock:
             self._items.clear()
 
 
-cache = TTLCache()
+cache = TTLCache(max_items=2048)
 
-# ============================================================================
-# SECTION 12 · 房间保活（内存优化版）
-# ============================================================================
-
+# 房间保活：连续扫描中至少出现一次则保留；连续 ROOM_KEEPALIVE_MISSES 次未扫到再移除
+ROOM_KEEPALIVE_MISSES = 5
 _room_keepalive: dict[str, dict[str, dict[str, Any]]] = {}
 _room_keepalive_lock = threading.Lock()
 
 
 def room_stable_key(room: dict[str, Any], server_id: str = "") -> str:
+    """生成跨扫描稳定的房间标识，避免 index 型 id 导致保活失效。"""
     sid = str(room.get("server_id") or server_id or "")
     session = str(room.get("sessionId") or room.get("session_id") or "").strip()
     rid = str(room.get("id") or "").strip()
+    # 真实 session 优先；排除 normalize 时用的 `{server}-{index}` 临时 id
     if session:
         return f"{sid}:sess:{session}"
     if rid and not re.match(rf"^{re.escape(sid)}-\d+$", rid):
@@ -1585,6 +1621,13 @@ def room_stable_key(room: dict[str, Any], server_id: str = "") -> str:
 
 
 def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """合并本轮扫描结果与保活缓存。
+
+    - 本轮扫到：重置 miss 计数并更新房间数据
+    - 本轮未扫到：miss + 1
+    - miss >= ROOM_KEEPALIVE_MISSES：从卡片移除
+    保活结果同时驱动卡片房间列表与游戏筛选（总房间 / 各游戏 tab）
+    """
     seen: dict[str, dict[str, Any]] = {}
     for room in current_rooms:
         rid = room_stable_key(room, server_id)
@@ -1597,7 +1640,7 @@ def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) ->
         for rid, room in seen.items():
             bucket[rid] = {"room": copy.deepcopy(room), "misses": 0}
 
-        # 未出现的房间累加miss，超限剔除
+        # 未出现的房间累加 miss，超限剔除
         for rid in list(bucket.keys()):
             if rid in seen:
                 continue
@@ -1606,26 +1649,18 @@ def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) ->
             if entry["misses"] >= ROOM_KEEPALIVE_MISSES:
                 del bucket[rid]
 
-        # 限制每个服务器的最大房间数
-        if len(bucket) > MAX_ROOMS_PER_SERVER:
-            # 保留最新的房间（按misses排序，misses少的更新）
-            sorted_items = sorted(
-                bucket.items(),
-                key=lambda x: (x[1]["misses"], -x[1]["room"].get("node_count", 0))
-            )
-            bucket.clear()
-            for rid, data in sorted_items[:MAX_ROOMS_PER_SERVER]:
-                bucket[rid] = data
-
+        # 输出仍保活的房间
         kept = [copy.deepcopy(v["room"]) for v in bucket.values()]
 
+        # 服务器已无任何保活房间时清理空桶
         if not bucket:
             _room_keepalive.pop(server_id, None)
 
     return kept
 
+
 # ============================================================================
-# SECTION 13 · 工具函数
+# SECTION 7 · 工具函数
 # ============================================================================
 
 def translate_error_message(msg: str) -> str:
@@ -1637,7 +1672,7 @@ def translate_error_message(msg: str) -> str:
     if "timed out" in msg_lower:
         return "连接超时"
     if "remote end closed connection" in msg_lower:
-        return "远程服务器关闭连接"
+        return "远程服务器关闭连接，未响应"
     if "connection refused" in msg_lower:
         return "连接被拒绝"
     if "name or service not known" in msg_lower:
@@ -1646,6 +1681,8 @@ def translate_error_message(msg: str) -> str:
         return "网络不可达"
     if "ssl" in msg_lower:
         return "SSL 证书错误"
+    if "graphql" in msg_lower:
+        return f"GraphQL 查询失败: {msg}"
     return f"服务器错误: {msg}"
 
 
@@ -1688,6 +1725,7 @@ def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, str]
         icon = QUESTION_ICON
     else:
         icon = f"https://api.nlib.cc/nx/{normalized or 'FFFFFFFFFFFFFFFF'}/icon/128/128"
+        # 备用图库 icon = f"https://tinfoil.media/ti/{normalized or 'FFFFFFFFFFFFFFFF'}/128/128"
 
     return {
         "name": game_name,
@@ -1695,7 +1733,7 @@ def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, str]
     }
 
 # ============================================================================
-# SECTION 14 · HTTP 客户端
+# SECTION 8 · HTTP 客户端
 # ============================================================================
 
 class HTTPResponse:
@@ -1772,7 +1810,7 @@ class HTTPClient:
 http = HTTPClient()
 
 # ============================================================================
-# SECTION 15 · LDN UDP 扫描
+# SECTION 9 · LDN UDP 扫描
 # ============================================================================
 
 GRAPHQL_QUERY = """
@@ -1790,13 +1828,14 @@ query PublicRoomSnapshot {
 }
 """.strip()
 
+UDP_SCAN_SECONDS = max(0.5, float(os.getenv("UDP_SCAN_SECONDS", "0.5")))
 LDN_PORT = 11452
 LDN_MAGIC = bytes.fromhex("00144511")
 LDN_SCAN_HEADER = LDN_MAGIC + bytes(8)
 SCANNER_VIRTUAL_IP = "10.13.37.0"
 LDN_BROADCAST_IP = "10.13.255.255"
 MAX_REASSEMBLED_PACKET = 65535
-MAX_SCAN_ITERATIONS = 500  # 减少扫描迭代次数
+MAX_SCAN_ITERATIONS = 2000
 SOCKET_MAX_LIFETIME = 300
 
 
@@ -1842,14 +1881,12 @@ def decompress_ldn(data: bytes, expected_size: int) -> bytes:
     output = bytearray()
     index = 0
     while index < len(data) and len(output) < expected_size:
-        value = data[index]
-        index += 1
+        value = data[index]; index += 1
         output.append(value)
         if value == 0:
             if index >= len(data):
                 raise ValueError("ldn_mitm 压缩数据不完整")
-            repeat = data[index]
-            index += 1
+            repeat = data[index]; index += 1
             output.extend(b"\x00" * repeat)
         if len(output) > expected_size:
             raise ValueError("ldn_mitm 解压数据越界")
@@ -1994,7 +2031,7 @@ class ActiveRoomScanner:
                 return self._sock
             self.close()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0.15)  # 减少超时
+        sock.settimeout(0.2)
         sock.connect((self.server["host"], self.server["port"]))
         self._sock = sock
         self._sock_created_at = now
@@ -2025,6 +2062,7 @@ class ActiveRoomScanner:
                 while time.monotonic() < deadline:
                     iterations += 1
                     if iterations > MAX_SCAN_ITERATIONS:
+                        warn(f"[扫描] {self.server['name']} 达到最大迭代上限，提前退出")
                         break
                     now = time.monotonic()
                     if now >= next_send:
@@ -2034,8 +2072,8 @@ class ActiveRoomScanner:
                             warn(f"[扫描] send 失败 {self.server['name']}: {e}")
                             self.close()
                             break
-                        next_send = now + 0.8  # 减少发送频率
-                    timeout = min(0.15, max(0.01, deadline - time.monotonic()))
+                        next_send = now + 0.7
+                    timeout = min(0.2, max(0.01, deadline - time.monotonic()))
                     sock.settimeout(timeout)
                     try:
                         frame = sock.recv(65535)
@@ -2067,7 +2105,7 @@ class ActiveRoomScanner:
                 return [], str(exc)
 
 # ============================================================================
-# SECTION 16 · 应用上下文
+# SECTION 10 · 应用上下文
 # ============================================================================
 
 class AppContext:
@@ -2078,7 +2116,6 @@ class AppContext:
         self.scanners: dict[str, ActiveRoomScanner] = {}
         self.game_titles: dict[str, str] = dict(BUILTIN_GAME_TITLES)
         self.download_status: dict[str, Any] = dict(_download_status)
-        self._refresh_counter = 0
 
     def refresh_config(self):
         with self.lock:
@@ -2098,11 +2135,6 @@ class AppContext:
 
             with _download_status_lock:
                 self.download_status = dict(_download_status)
-            
-            # 定期触发GC
-            self._refresh_counter += 1
-            if self._refresh_counter % 5 == 0:
-                gc.collect()
 
     def get_server(self, sid: str) -> dict[str, Any] | None:
         with self.lock:
@@ -2120,10 +2152,11 @@ class AppContext:
 ctx = AppContext()
 
 # ============================================================================
-# SECTION 17 · 服务器配置管理
+# SECTION 11 · 服务器配置管理（含 ID 唯一性校验 + 严格 IPv4）
 # ============================================================================
 
 def is_id_available(new_id: str, exclude_id: str | None = None) -> bool:
+    """检查 new_id 是否在所有服务器中唯一（排除 exclude_id）"""
     if not new_id:
         return False
     all_servers = ctx.get_all_servers()
@@ -2134,20 +2167,24 @@ def is_id_available(new_id: str, exclude_id: str | None = None) -> bool:
 
 
 def is_valid_host(host: str) -> bool:
+    """严格校验主机地址，防止 'x.x.x.x.x' 等错误格式通过"""
     if not host:
         return False
     host = host.strip()
+    # 纯数字和点：必须为IPv4（4段，每段0-255，无前导零）
     if re.fullmatch(r"^[\d.]+$", host):
         if not re.fullmatch(r"^(\d{1,3}\.){3}\d{1,3}$", host):
             return False
         parts = host.split('.')
         return all(0 <= int(p) <= 255 and p == str(int(p)) for p in parts)
+    # IPv6（方括号包裹）
     if host.startswith('[') and host.endswith(']'):
         ipv6 = host[1:-1]
         return re.fullmatch(
             r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::|^([0-9a-fA-F]{1,4}:){1,7}:$",
             ipv6
         ) is not None
+    # 域名（标准格式）
     return re.fullmatch(r"^(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$", host) is not None
 
 
@@ -2203,6 +2240,7 @@ def _load_servers_from_file(file_path: str) -> list[dict[str, Any]]:
     return servers
 
 
+# 服务器列表加载签名：仅在内容变化时写日志，避免跟随轮询重复叠加
 _servers_load_logged_sig: str = ""
 _servers_missing_local_logged: bool = False
 
@@ -2270,6 +2308,7 @@ def _load_servers_merged() -> list[dict[str, Any]]:
     builtin_count = sum(1 for s in merged.values() if s.get("is_builtin"))
     remote_count = sum(1 for s in merged.values() if s.get("is_remote"))
     manual_count = sum(1 for s in merged.values() if s.get("is_manual"))
+    # 仅在服务器列表实际变化时打日志，避免每秒轮询 refresh_config 重复叠加
     sig = f"{total}:{builtin_count}:{remote_count}:{manual_count}:" + ",".join(sorted(merged.keys()))
     if sig != _servers_load_logged_sig:
         info(f"[配置] 服务器列表加载完成，共 {total} 台（内置 {builtin_count}，远程 {remote_count}，自定义 {manual_count}）")
@@ -2277,11 +2316,11 @@ def _load_servers_merged() -> list[dict[str, Any]]:
     return list(merged.values())
 
 # ============================================================================
-# SECTION 18 · 房间扫描 & 规范化
+# SECTION 12 · 房间扫描 & 规范化
 # ============================================================================
 
 SCAN_EXECUTOR = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS,
+    max_workers=min(MAX_WORKERS, 64),
     thread_name_prefix="scanner"
 )
 
@@ -2420,7 +2459,7 @@ def scan_server(server: dict[str, Any], force: bool = False) -> tuple[dict[str, 
     for room in (*result.get("rooms", []), *active_rooms):
         rid = str(room.get("id") or f"{room.get('server_id')}:{room.get('host')}:{room.get('content_id')}")
         merged[rid] = room
-    
+    # 房间保活：5 次扫描内出现过则保留，连续 5 次未扫到再消失
     result["rooms"] = apply_room_keepalive(server["id"], list(merged.values()))
     result["room_count"] = len(result["rooms"])
     result["scanner_error"] = scanner_error
@@ -2474,17 +2513,10 @@ def scan_all(force: bool = False) -> tuple[list[dict[str, Any]], bool]:
             results[sid] = fallback
             all_cached = False
 
-    # 触发GC（每10次扫描）
-    if not hasattr(scan_all, "_gc_counter"):
-        scan_all._gc_counter = 0
-    scan_all._gc_counter += 1
-    if scan_all._gc_counter % 10 == 0:
-        gc.collect()
-
     return [results[s["id"]] for s in servers_snapshot if s["id"] in results], all_cached
 
 # ============================================================================
-# SECTION 19 · HTTP 请求参数 & 响应辅助
+# SECTION 13 · HTTP 请求参数 & 响应辅助
 # ============================================================================
 
 def parse_query(query_string: str) -> dict[str, str]:
@@ -2524,7 +2556,7 @@ def make_json_response(data: dict[str, Any], cache_hit: bool = False,
     return body, headers, status
 
 # ============================================================================
-# SECTION 20 · 前端页面模板
+# SECTION 14 · 前端页面模板（读取外部文件）
 # ============================================================================
 
 def get_static_file(filename: str) -> str:
@@ -2548,6 +2580,7 @@ def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
 
 
 def build_pwa_icon_png(size: int) -> bytes:
+    """从前端 script.js 的 Base64 常量自动还原 PWA 图标，无需额外图片文件。"""
     size = 512 if int(size) >= 512 else 192
     cached = _PWA_ICON_CACHE.get(size)
     if cached is not None:
@@ -2565,7 +2598,9 @@ def build_pwa_icon_png(size: int) -> bytes:
     except Exception as exc:
         warn(f"[PWA] 从前端还原内嵌图标失败 size={size}: {exc}")
 
+    # 前端常量缺失或损坏时，使用零依赖备用图标，确保 PWA 接口仍有效。
     raw = bytearray()
+    # 三个网络节点组成三角形，适合 any/maskable 图标安全区。
     nodes = (
         (int(size * 0.50), int(size * 0.25)),
         (int(size * 0.28), int(size * 0.69)),
@@ -2575,8 +2610,7 @@ def build_pwa_icon_png(size: int) -> bytes:
     line_w = size * 0.030
 
     def near_segment(px: float, py: float, a: tuple[int, int], b: tuple[int, int]) -> bool:
-        ax, ay = a
-        bx, by = b
+        ax, ay = a; bx, by = b
         vx, vy = bx - ax, by - ay
         denom = vx * vx + vy * vy
         if denom <= 0:
@@ -2587,8 +2621,9 @@ def build_pwa_icon_png(size: int) -> bytes:
         return dx * dx + dy * dy <= line_w * line_w
 
     for y in range(size):
-        raw.append(0)
+        raw.append(0)  # PNG scanline filter: None
         for x in range(size):
+            # 深蓝至青色渐变背景，整块铺满以兼容 maskable。
             fx = x / max(1, size - 1)
             fy = y / max(1, size - 1)
             r = int(13 + 10 * fx)
@@ -2679,6 +2714,7 @@ self.addEventListener('fetch', event => {{
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+  // API、下载与实时数据始终走网络，绝不缓存。
   if (url.pathname.startsWith('/api/')) return;
 
   event.respondWith((async () => {{
@@ -2702,6 +2738,7 @@ self.addEventListener('fetch', event => {{
 
 
 def build_html() -> str:
+    """页面壳：带 PWA 清单、安装元信息，并加载合并后的前端脚本。"""
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2724,7 +2761,7 @@ def build_html() -> str:
 </html>"""
 
 # ============================================================================
-# SECTION 21 · HTTP 请求处理器
+# SECTION 15 · HTTP 请求处理器（含 ID 添加/编辑支持）
 # ============================================================================
 
 class MonitorHandler(BaseHTTPRequestHandler):
@@ -2786,6 +2823,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
                 file_path = SCRIPT_DIR / filename
+                # 单文件版：前端只保留 script.js（含全部 HTML/CSS）与 GoEasy SDK
                 if file_path.is_file() and filename in ("script.js", "goeasy.min.js"):
                     content_type = {
                         "script.js": "application/javascript; charset=utf-8",
@@ -2796,6 +2834,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         self.send_response(200)
                         self.send_header("Content-Type", content_type)
                         self.send_header("Content-Length", str(len(body)))
+                        # script.js 禁止缓存，确保前端逻辑能及时生效
                         if filename == "script.js":
                             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                             self.send_header("Pragma", "no-cache")
@@ -2823,6 +2862,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     return
 
             if path == "/api/env/runtime":
+                # 公开最小配置：仅供前端初始化聊天，不含 R2 密钥。
                 try:
                     cfg = load_env_config()
                     data = {
@@ -2852,6 +2892,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     )
                     pw_ok = bool(provided_pw) and verify_password(provided_pw)
 
+                    # 完整 /api/env（含全部密钥）访问策略：
+                    # - 已设密码：必须提供正确密码
+                    # - 公网且未设密码：拒绝，要求先设密码
+                    # - 局域网且未设密码：允许（与设置页「局域网跳过」一致）
                     allow_full = False
                     if password_set:
                         if not pw_ok:
@@ -2968,6 +3012,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     pass
                 except Exception as e:
                     err(f"[浏览器下载] 转发失败: {e}")
+                    # 若响应头尚未发出，可返回明确错误；流式传输中途失败则直接结束连接。
                     try:
                         if not getattr(self, "_browser_download_started", False):
                             self.send_response(400)
@@ -2990,6 +3035,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         "client_ip": client_ip,
                     }
                     body, headers, status = make_json_response(data)
+                    # 网络类型用于下载分流，禁止代理/浏览器缓存旧结果。
                     headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
                 except Exception as e:
                     data = {"ok": False, "error": str(e)}
@@ -3037,6 +3083,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/logs":
                 try:
+                    # 日志采用长轮询：只有日志版本发生变化时才立即返回，
+                    # 不再按固定间隔跟随页面轮询刷新。
                     try:
                         since_version = max(0, int(query.get("version", "-1")))
                     except (TypeError, ValueError):
@@ -3045,23 +3093,26 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     if wait_logs and since_version >= 0:
                         log_version, logs = log_capturer.wait_for_change(since_version)
                     else:
-                        log_version, logs = log_capturer.get_logs_snapshot(100)
+                        log_version, logs = log_capturer.get_logs_snapshot(200)
                     with _download_status_lock:
                         st = dict(_download_status)
                     log_lines = list(logs)
                     
+                    # ★ 拼接常驻日志，确保可以在 App 查看状态
+                    # (原 android_filechooser 日志已整合到 android_native.get_status_logs() 中)
                     try:
                         import android_native
                         log_lines.extend(android_native.get_status_logs())
                     except Exception:
                         pass
 
+                    # 新增：把"是否已加入电池白名单"也展示出来
                     try:
                         import android_native
                         if android_native.is_ignoring_battery_optimizations():
-                            log_lines.append("[电池优化] ✅ 已在白名单")
+                            log_lines.append("[电池优化] ✅ 已在白名单(应用不会被系统杀进程)")
                         else:
-                            log_lines.append("[电池优化] ⚠️ 仍在电池优化名单中")
+                            log_lines.append("[电池优化] ⚠️ 仍在电池优化名单中(建议在系统设置里放行)")
                     except Exception:
                         pass
 
@@ -3103,6 +3154,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0))
             content_type = self.headers.get("Content-Type", "") or ""
 
+            # ---- 用户头像上传 → R2 稳定对象键（同一 userId 永久覆盖同一路径） ----
             if path == "/api/avatar/upload":
                 try:
                     missing_r2 = []
@@ -3113,7 +3165,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     if R2_MAX_UPLOAD_MB <= 0: missing_r2.append("max_upload_mb")
                     if R2_MAX_STORAGE_MB <= 0: missing_r2.append("max_storage_mb")
                     if missing_r2:
-                        raise ValueError("R2 未配置完整：" + ", ".join(missing_r2))
+                        raise ValueError("R2 未配置完整，请先设置：" + ", ".join(missing_r2))
                     if content_length <= 0:
                         raise ValueError("空请求体")
                     avatar_limit = min(R2_MAX_UPLOAD_MB, 5) * 1024 * 1024
@@ -3148,6 +3200,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     else:
                         raise ValueError("头像仅支持 PNG、JPEG 或 WebP 图片")
 
+                    # 达到容量阈值时只清理聊天媒体，avatars/ 始终保留。
                     total_bytes = get_r2_bucket_total_size()
                     if total_bytes >= R2_MAX_STORAGE_MB * 1024 * 1024:
                         empty_r2_bucket(preserve_avatars=True)
@@ -3156,7 +3209,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     r2_put_object(avatar_data, object_key, avatar_type)
                     version = hashlib.sha256(avatar_data).hexdigest()[:24]
                     avatar_url = r2_public_object_url(object_key, version)
-                    info(f"[R2头像] 上传成功 user={user_id} size={len(avatar_data)}")
+                    info(f"[R2头像] 上传成功 user={user_id} size={len(avatar_data)} key={object_key}")
                     check_r2_bucket_capacity("上传后检查")
                     data = {
                         "ok": True,
@@ -3172,6 +3225,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self._send(body, headers, status)
                 return
 
+            # ---- 聊天媒体上传 → Cloudflare R2 ----
             if path == "/api/upload":
                 try:
                     missing_r2 = []
@@ -3182,11 +3236,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     if R2_MAX_UPLOAD_MB <= 0: missing_r2.append("max_upload_mb")
                     if R2_MAX_STORAGE_MB <= 0: missing_r2.append("max_storage_mb")
                     if missing_r2:
-                        raise ValueError("R2 未配置完整：" + ", ".join(missing_r2))
+                        raise ValueError("R2 未配置完整，请先设置：" + ", ".join(missing_r2))
                     if content_length <= 0:
                         raise ValueError("空请求体")
                     if content_length > R2_MAX_UPLOAD_MB * 1024 * 1024 + 1024 * 1024:
                         raise ValueError(f"文件过大，最大允许 {R2_MAX_UPLOAD_MB}MB")
+                    # 按用户配置的容量限制检查；不再内置固定桶容量值。
                     try:
                         total_bytes = get_r2_bucket_total_size()
                         limit_bytes = R2_MAX_STORAGE_MB * 1024 * 1024
@@ -3197,6 +3252,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                 info("[R2] 聊天媒体已清理，用户头像已保留，继续本次上传")
                             except Exception as exc:
                                 err(f"[R2] 清空存储桶异常: {exc}")
+                            # 清空后继续本次上传，不再拒绝
                     except ValueError:
                         raise
                     except Exception as exc:
@@ -3217,17 +3273,20 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     data = file_part["data"]
                     if len(data) > R2_MAX_UPLOAD_MB * 1024 * 1024:
                         raise ValueError(f"文件过大，最大允许 {R2_MAX_UPLOAD_MB}MB")
+                    # 原始文件名（含中文），返回给前端显示
                     original_filename = file_part.get("filename") or "file"
+                    # object_key 只用 UUID+ASCII扩展名，避免中文导致 R2 签名/URL 问题
                     filename = _cos_safe_filename(original_filename)
                     ctype = file_part.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     file_type = _cos_guess_file_type(filename, ctype)
                     day = datetime.now(timezone.utc).strftime("%Y%m%d")
+                    # 从安全文件名提取纯 ASCII 扩展名
                     safe_base = re.sub(r"[^a-zA-Z0-9._-]", "", filename)
                     ext_match = re.search(r"(\.[a-zA-Z0-9_.-]+)$", safe_base)
                     ext = ext_match.group(1) if ext_match else ""
                     object_key = f"chat/{file_type}/{day}/{uuid.uuid4().hex}{ext}"
                     url = r2_put_object(data, object_key, ctype)
-                    info(f"[R2] 上传成功 type={file_type} size={len(data)}")
+                    info(f"[R2] 上传成功 type={file_type} size={len(data)} key={object_key}")
                     check_r2_bucket_capacity("上传后检查")
                     resp = {
                         "ok": True,
@@ -3247,6 +3306,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self._send(body, headers, status)
                 return
 
+            # 其余 POST 接口使用 JSON body
             try:
                 raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
                 req_json = json.loads(raw_body.decode("utf-8") or "{}")
@@ -3255,6 +3315,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             except Exception:
                 req_json = {}
 
+            # ---- 内置下载器：流式下载到 Android /Download ----
             if path == "/api/download":
                 try:
                     download_url = str(req_json.get("url", "")).strip()
@@ -3262,6 +3323,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     restore_xor = bool(req_json.get("xor", False))
                     if not download_url:
                         raise ValueError("缺少下载地址")
+                    # 后端再次兜底：公网请求禁止写入服务端手机 Download 目录，通知前端改走浏览器。
                     is_public, client_ip = is_public_request(self)
                     if is_public:
                         data = {
@@ -3274,7 +3336,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         self._send(body, headers, status)
                         return
                     result = download_url_to_android(download_url, download_name, restore_xor)
-                    info(f"[下载器] 完成 name={result['file_name']} size={result['file_size']}")
+                    info(
+                        f"[下载器] 下载完成 name={result['file_name']} size={result['file_size']} "
+                        f"path={result['file_path']} xor={restore_xor}"
+                    )
                     data = {"ok": True, **result}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -3297,7 +3362,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
                     if srv_id:
                         if not ID_RE.fullmatch(srv_id):
-                            raise ValueError("ID 格式无效")
+                            raise ValueError("ID 格式无效，仅允许字母、数字、下划线、空格和连字符，长度1-64")
                         if not is_id_available(srv_id):
                             raise ValueError(f"ID '{srv_id}' 已被其他服务器占用")
                     else:
@@ -3365,7 +3430,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
                     if new_id != old_id:
                         if not ID_RE.fullmatch(new_id):
-                            raise ValueError("新 ID 格式无效")
+                            raise ValueError("新 ID 格式无效，仅允许字母、数字、下划线、空格和连字符，长度1-64")
                         if not is_id_available(new_id, exclude_id=old_id):
                             raise ValueError(f"ID '{new_id}' 已被其他服务器占用")
 
@@ -3403,6 +3468,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/env/set-password":
                 try:
+                    # 若已设置密码，则需先用旧密码验证才能修改
                     if is_password_set():
                         old_pw = str(req_json.get("old_password", ""))
                         if not verify_password(old_pw):
@@ -3435,6 +3501,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/env/save":
                 try:
+                    # 安全：若已设置密码，必须提供正确密码才能修改配置
                     if is_password_set():
                         pw = str(req_json.get("password", ""))
                         if not verify_password(pw):
@@ -3456,8 +3523,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 try:
                     result = do_update_frontend()
                     if result.get("ok"):
-                        data = {"ok": True, "skipped": result.get("skipped", False), 
-                                "message": result.get("message", ""), "target": "frontend"}
+                        if result.get("skipped"):
+                            data = {"ok": True, "skipped": True, "message": result.get("message"), "target": "frontend"}
+                        else:
+                            data = {"ok": True, "skipped": False, "message": result.get("message", "前端更新完成请重启应用"), "target": "frontend"}
                         body, headers, status = make_json_response(data)
                     else:
                         data = {"ok": False, "error": result.get("error", "更新失败"), "target": "frontend"}
@@ -3472,8 +3541,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 try:
                     result = do_update_backend()
                     if result.get("ok"):
-                        data = {"ok": True, "skipped": result.get("skipped", False),
-                                "message": result.get("message", ""), "target": "backend"}
+                        if result.get("skipped"):
+                            data = {"ok": True, "skipped": True, "message": result.get("message"), "target": "backend", "mode": result.get("mode")}
+                        else:
+                            data = {"ok": True, "skipped": False, "message": result.get("message", "后端更新完成请重启应用"), "target": "backend", "mode": result.get("mode")}
                         body, headers, status = make_json_response(data)
                     else:
                         data = {"ok": False, "error": result.get("error", "更新失败"), "target": "backend"}
@@ -3559,7 +3630,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             err(f"[HTTP] _send 异常: {e}")
 
 # ============================================================================
-# SECTION 22 · 入口
+# SECTION 16 · 入口
 # ============================================================================
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -3567,21 +3638,22 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 
 def main() -> None:
-    time.sleep(1.0)
+    time.sleep(1.0) # 启动等待时长
     ensure_frontend_exists()
-    ensure_env_config()
-    # 如果存在旧的 security.json 需要迁移，可取消下面一行的注释
+    ensure_env_config()          # 若 env.json 不存在则自动创建空配置
+    # 若存在旧的 security.json 需要迁移，可取消下面一行的注释
     # migrate_security_from_old_file()
     runtime_env_config = load_env_config()
     apply_r2_config_to_runtime(runtime_env_config)
     ctx.refresh_config()
     info(f"[配置] 环境变量配置文件: {ENV_CONFIG_FILE}")
     info(f"[配置] 初始服务器数: {len(ctx.servers)}")
-    info(f"[配置] 远程下载间隔: {REMOTE_DOWNLOAD_INTERVAL} 秒")
+    info(f"[配置] 远程文件下载间隔: {REMOTE_DOWNLOAD_INTERVAL} 秒")
+    info(f"[配置] 远程服务器列表本地路径: {LOCAL_SERVERS_FILE}")
+    info(f"[配置] 远程标题映射本地路径: {LOCAL_CHINESE_DB_FILE}")
     info(f"[配置] 全局 TTL: {CACHE_TTL} 秒")
-    info(f"[配置] 最大工作线程: {MAX_WORKERS}")
-    info(f"[配置] 每个服务器最大房间数: {MAX_ROOMS_PER_SERVER}")
 
+    # 仅配置完整时检查 R2；无内置值的全新安装直接跳过。
     r2_ready = bool(
         R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME
         and R2_MAX_UPLOAD_MB > 0 and R2_MAX_STORAGE_MB > 0
@@ -3607,7 +3679,6 @@ def main() -> None:
             scanner.close()
         SCAN_EXECUTOR.shutdown(wait=False)
         httpd.server_close()
-
 
 if __name__ == "__main__":
     main()
