@@ -366,6 +366,12 @@ html.dark .glass{border-color:rgba(255,255,255,.05)}
   overflow:visible;
   outline:none!important;
   -webkit-tap-highlight-color:transparent;
+  /* FIX(长按排序): 让图标按钮自身禁用原生 pan-x 手势。
+     .brand-area 是 touch-action:pan-x 的可横向滚动容器，若触摸点允许 pan-x，
+     Android 原生横滚层会截获左右拖动并触发 pointercancel，导致长按后必须先往下拖动
+     才能排序。把按钮设为 touch-action:none 后，长按即可立即左右拖动排序；
+     导航栏整体仍可借助按钮间的空隙/内边距区横向滚动。 */
+  touch-action:none;
 }
 /* 导航栏图标拖拽排序 */
 .brand-area > button.nav-dragging{
@@ -824,45 +830,56 @@ html.dark .ov-card.online b{color:#3dd9b8}html.dark .ov-card.idle b{color:#ffb34
   position: relative;
   background:var(--white);
   border-radius:var(--radius-md);
-  filter: drop-shadow(0 6px 20px rgba(82,142,178,.06));
+  /* 修复：原先使用 filter: drop-shadow，深色模式下会在卡片圆角、左右边缘和卡片间距处形成明显黑色块/黑色背景。
+     改为更轻的 box-shadow + 细边框，保留层次感，同时避免截图中圈出的黑边。 */
+  filter:none;
+  box-shadow:0 6px 18px rgba(82,142,178,.06), inset 0 0 0 1px rgba(55,130,175,.08);
   overflow:hidden;
   will-change:auto;
   contain:layout style paint;
   cursor:grab;
-  transition: filter 0.25s ease;
+  transition: box-shadow 0.25s ease, transform 0.25s ease, background 0.25s ease;
   touch-action:pan-y;
 }
 .server-group:active{cursor:grabbing}
 .server-group:hover {
-  filter: drop-shadow(0 10px 30px rgba(82,142,178,.1));
+  filter:none;
+  box-shadow:0 10px 24px rgba(82,142,178,.10), inset 0 0 0 1px rgba(55,130,175,.10);
 }
 .server-group.dragging{
   opacity:0.4;
   transform:scale(0.98);
-  filter: drop-shadow(0 20px 40px rgba(0,0,0,0.15));
+  filter:none;
+  box-shadow:0 14px 28px rgba(0,0,0,0.12), inset 0 0 0 1px rgba(25,200,174,.20);
   border-radius:var(--radius-md) !important;
   overflow:hidden;
 }
 .server-group.drag-over{border:2px dashed var(--cyan);background:rgba(25,200,174,.05)}
 
 html.dark .server-group {
-  filter: drop-shadow(0 6px 20px rgba(0,0,0,0.5));
+  filter:none;
+  box-shadow:0 1px 0 rgba(255,255,255,.035), inset 0 0 0 1px rgba(255,255,255,.045);
 }
 html.dark .server-group:hover {
-  filter: drop-shadow(0 10px 30px rgba(0,0,0,0.6));
+  filter:none;
+  box-shadow:0 2px 10px rgba(46,230,200,.06), inset 0 0 0 1px rgba(46,230,200,.10);
 }
 html.dark .server-group.dragging {
-  filter: drop-shadow(0 20px 40px rgba(0,0,0,0.7));
+  filter:none;
+  box-shadow:0 10px 22px rgba(0,0,0,.22), inset 0 0 0 1px rgba(46,230,200,.22);
 }
 @media (prefers-color-scheme: dark) {
   :root:not(.light) .server-group {
-    filter: drop-shadow(0 6px 20px rgba(0,0,0,0.5));
+    filter:none;
+    box-shadow:0 1px 0 rgba(255,255,255,.035), inset 0 0 0 1px rgba(255,255,255,.045);
   }
   :root:not(.light) .server-group:hover {
-    filter: drop-shadow(0 10px 30px rgba(0,0,0,0.6));
+    filter:none;
+    box-shadow:0 2px 10px rgba(46,230,200,.06), inset 0 0 0 1px rgba(46,230,200,.10);
   }
   :root:not(.light) .server-group.dragging {
-    filter: drop-shadow(0 20px 40px rgba(0,0,0,0.7));
+    filter:none;
+    box-shadow:0 10px 22px rgba(0,0,0,.22), inset 0 0 0 1px rgba(46,230,200,.22);
   }
 }
 
@@ -1349,14 +1366,16 @@ html.dark .skeleton{background:linear-gradient(100deg,#1a2530 20%,#243240 38%,#1
   background:#cde9fa;
   color:#0c5d91;
   font-weight:800;
-  filter: drop-shadow(0 2px 8px rgba(97,194,233,.25));
+  filter:none;
+  box-shadow:none;
 }
 html.dark .filter-tab{background:rgba(255,255,255,.06)}
 html.dark .filter-tab:hover{background:rgba(255,255,255,.10)}
 html.dark .filter-tab.active{
   background:rgba(97,194,233,.20);
   color:#7dd3fc;
-  filter: drop-shadow(0 2px 8px rgba(97,194,233,.3));
+  filter:none;
+  box-shadow:none;
 }
 @media (prefers-color-scheme: dark){
   :root:not(.light) .filter-tab{background:rgba(255,255,255,.06)}
@@ -1364,7 +1383,8 @@ html.dark .filter-tab.active{
   :root:not(.light) .filter-tab.active{
     background:rgba(97,194,233,.20);
     color:#7dd3fc;
-    filter: drop-shadow(0 2px 8px rgba(97,194,233,.3));
+    filter:none;
+    box-shadow:none;
   }
 }
 
@@ -4354,6 +4374,13 @@ html:not(.dark) {
       if(ev.button!=null && ev.button!==0) return;
       sx=ev.clientX; sy=ev.clientY;
       lpTimer=setTimeout(()=>{
+        // 若本次长按是导航栏图标排序拖拽（380ms 已进入拖拽），则取消主题的“回到跟随系统”长按，
+        // 避免长按排序时误触发主题切换/重置。
+        if(themeToggleBtn.classList.contains('nav-dragging')
+          || (themeToggleBtn.closest('#brandArea') && themeToggleBtn.closest('#brandArea').classList.contains('nav-reordering'))){
+          lpTimer=null;
+          return;
+        }
         try{ localStorage.removeItem('lan_play_theme'); }catch(e3){}
         const next=_resolveThemeCompat();
         _applyThemeToDomCompat(next);
@@ -4696,6 +4723,8 @@ html:not(.dark) {
     let ghostEl = null;
     let lastX = 0;
     let lastY = 0;
+    let autoScrollRAF = null;
+    let scrollPanning = false;
 
     function clearTimer() {
       if (longPressTimer) {
@@ -4751,6 +4780,7 @@ html:not(.dark) {
     }
 
     function endDragVisual() {
+      stopAutoScroll();
       clearDragOver();
       if (dragEl) dragEl.classList.remove('nav-dragging');
       area.classList.remove('nav-reordering');
@@ -4770,6 +4800,40 @@ html:not(.dark) {
       area.classList.remove('nav-holding');
     }
 
+    // ---- 拖拽时靠近左右边缘自动翻滚导航栏 ----
+    function stopAutoScroll() {
+      if (autoScrollRAF) {
+        cancelAnimationFrame(autoScrollRAF);
+        autoScrollRAF = null;
+      }
+    }
+
+    function tickAutoScroll() {
+      autoScrollRAF = null;
+      if (!dragging || !dragEl) return;
+      const rect = area.getBoundingClientRect();
+      const EDGE = 56;      // 触发自动翻滚的边缘距离（px）
+      const MAX_SPEED = 14; // 每帧最大滚动像素（越贴近边缘越快）
+      let scrollBy = 0;
+      if (rect.width > 0) {
+        if (lastX < rect.left + EDGE) {
+          const d = (rect.left + EDGE) - lastX;
+          scrollBy = -Math.min(MAX_SPEED, Math.round((d / EDGE) * MAX_SPEED));
+        } else if (lastX > rect.right - EDGE) {
+          const d = lastX - (rect.right - EDGE);
+          scrollBy = Math.min(MAX_SPEED, Math.round((d / EDGE) * MAX_SPEED));
+        }
+      }
+      if (scrollBy !== 0) {
+        area.scrollLeft += scrollBy;
+        // 滚动后指针下方的图标可能已变化，刷新落点高亮
+        clearDragOver();
+        const over = getBtnFromPoint(lastX, lastY);
+        if (over && over !== dragEl) over.classList.add('nav-drag-over');
+      }
+      autoScrollRAF = requestAnimationFrame(tickAutoScroll);
+    }
+
     function onPointerDown(e) {
       if (e.button != null && e.button !== 0) return;
       const btn = e.target.closest('#brandArea > button');
@@ -4781,6 +4845,7 @@ html:not(.dark) {
       lastY = e.clientY;
       dragging = false;
       dragEl = null;
+      scrollPanning = false;
       clearTimer();
       // 按下即禁用原生 pan-x，长按后可直接左右拖排序
       try { area.style.touchAction = 'none'; } catch (_) { /* ignore */ }
@@ -4797,6 +4862,7 @@ html:not(.dark) {
           }
         } catch (_) { /* ignore */ }
         try { if (navigator.vibrate) navigator.vibrate(12); } catch (_) { /* ignore */ }
+        tickAutoScroll();
       }, 380);
     }
 
@@ -4811,7 +4877,18 @@ html:not(.dark) {
           if (dx * dx + dy * dy > 400) { // ~20px
             clearTimer();
             restoreAreaTouchAction();
+            // 转为手动横向滚动：跟手滚动导航栏（按钮 touch-action:none 下原生横滚不可用）
+            scrollPanning = true;
+            area.scrollLeft -= dx;
+            startX = e.clientX;
+            startY = e.clientY;
+            e.preventDefault();
           }
+        } else if (scrollPanning) {
+          area.scrollLeft -= (e.clientX - startX);
+          startX = e.clientX;
+          startY = e.clientY;
+          e.preventDefault();
         }
         return;
       }
@@ -4828,6 +4905,7 @@ html:not(.dark) {
       if (!dragging || !dragEl) {
         dragging = false;
         dragEl = null;
+        scrollPanning = false;
         activePointerId = null;
         endDragVisual();
         restoreAreaTouchAction();
@@ -4863,6 +4941,7 @@ html:not(.dark) {
       endDragVisual();
       dragging = false;
       dragEl = null;
+      scrollPanning = false;
       activePointerId = null;
       restoreAreaTouchAction();
     }
@@ -5672,6 +5751,74 @@ function applyFilter(autoExpand) {
 
   // ===== 拖拽排序 =====
   let draggedEl = null;
+
+  // ---- 服务器卡片拖拽：靠近视口上下边缘时自动翻滚页面 ----
+  // 说明：HTML5 原生拖拽期间部分 WebView 会暂停 requestAnimationFrame，
+  // 因此用 setInterval 驱动。要「快且丝滑」的关键是：
+  //   1) interval 保持很小的固定值（16ms），高频率、小步长滚动，而不是大步长跳跃；
+  //   2) 用亚像素累积 + 速度平滑，消除起步/停止时的顿挫；
+  //   3) 在边缘停留越久越快（dwell 加速），长列表可快速翻到目标位置。
+  // 调速只改 CARD_MAX_SPEED（基础速度）与 CARD_ACCEL（停留加速强度）即可。
+  let _cardDragLastY = 0;
+  let _cardDragAutoScrollTimer = null;
+  let _cardDragSpeed = 0;              // 当前滚动速度（px/tick，带平滑）
+  let _cardDragAccum = 0;              // 亚像素累积，保证低速时也能连续滚动
+  let _cardDragEdgeSince = 0;          // 进入边缘区的时间戳（用于 dwell 加速）
+  const CARD_AUTO_SCROLL_INTERVAL = 16; // ms（固定小值，保证丝滑）
+  const CARD_EDGE = 160;                // 触发区高度（px）
+  const CARD_MAX_SPEED = 300;           // 每 tick 基础最大滚动像素（越贴近边缘越快）
+  const CARD_ACCEL = 0.0016;            // dwell 加速：每秒速度按此指数放大
+  const CARD_SMOOTH = 0.85;             // 速度平滑系数（0~1，越大响应越快）
+
+  function _stopCardDragAutoScroll() {
+    if(_cardDragAutoScrollTimer) {
+      clearInterval(_cardDragAutoScrollTimer);
+      _cardDragAutoScrollTimer = null;
+    }
+    _cardDragSpeed = 0;
+    _cardDragAccum = 0;
+    _cardDragEdgeSince = 0;
+  }
+
+  function _cardDragScrollStep() {
+    if (!draggedEl) { _stopCardDragAutoScroll(); return; }
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    // 目标速度：越贴近边缘越快，方向取决于在上缘还是下缘
+    let proximity = 0;   // 0~1，越贴近边缘越接近 1
+    let dir = 0;
+    if (_cardDragLastY < CARD_EDGE) {
+      dir = -1;
+      proximity = (CARD_EDGE - _cardDragLastY) / CARD_EDGE;
+    } else if (_cardDragLastY > vh - CARD_EDGE) {
+      dir = 1;
+      proximity = (_cardDragLastY - (vh - CARD_EDGE)) / CARD_EDGE;
+    }
+    let target = 0;
+    if (dir !== 0) {
+      if (!_cardDragEdgeSince) _cardDragEdgeSince = Date.now();
+      const dwell = Date.now() - _cardDragEdgeSince;
+      const accel = Math.pow(2, dwell * CARD_ACCEL);   // 每约 0.6s 翻倍
+      target = dir * proximity * CARD_MAX_SPEED * accel;
+    } else {
+      _cardDragEdgeSince = 0;
+    }
+    // 平滑逼近目标速度，避免速度突变造成顿挫
+    _cardDragSpeed += (target - _cardDragSpeed) * CARD_SMOOTH;
+    // 亚像素累积：小数部分暂存，凑满 1px 再滚动，保证连续顺滑
+    _cardDragAccum += _cardDragSpeed;
+    const step = Math.trunc(_cardDragAccum);
+    _cardDragAccum -= step;
+    if (step !== 0) window.scrollBy(0, step);
+  }
+
+  document.addEventListener('dragover', function (e) {
+    if (!draggedEl) return;
+    _cardDragLastY = e.clientY;
+    if (!_cardDragAutoScrollTimer) {
+      _cardDragAutoScrollTimer = setInterval(_cardDragScrollStep, CARD_AUTO_SCROLL_INTERVAL);
+    }
+  });
+
   function initDragAndDrop(div, s) {
     div.setAttribute('draggable', 'true');
     // 记录按下位置，供 dragstart 计算拖影相对卡片的偏移，使拖影与卡片对齐
@@ -5707,6 +5854,7 @@ function applyFilter(autoExpand) {
     div.addEventListener('dragend', () => {
       div.classList.remove('dragging');
       draggedEl = null;
+      _stopCardDragAutoScroll();
       document.querySelectorAll('.server-group').forEach(el => el.classList.remove('drag-over'));
     });
     div.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (div !== draggedEl) div.classList.add('drag-over'); });
@@ -11724,29 +11872,66 @@ function renderFilters() {
   }
 
   // 点击 ⚙️ 入口：先做安全检测
-  async function openEnvSettingsWithSecurity(onOpen) {
-    let isPublic = false;
-    let passwordSet = false;
-    try {
-      const st = await getJSON('/api/env/security-status?_=' + Date.now());
-      if (st && st.ok) {
-        isPublic = !!st.is_public;
-        passwordSet = !!st.password_set;
-        state.envIsPublic = isPublic;
-        state.envPasswordSet = passwordSet;
-      }
-    } catch (e) { console.warn('[env安全] 安全检测失败，按未设密码处理', e); }
+  // ★ 修复：安全检测结果在页面加载时预取并缓存 + 后台刷新，
+  //   点击图标时直接命中缓存立即打开，不再等待 /api/env/security-status 网络往返。
+  let _envSecurityCache = null;          // { is_public, password_set, at }
+  let _envSecurityFetching = false;
+  const ENV_SECURITY_CACHE_TTL = 10000;  // 缓存有效期（毫秒），期间点击零延迟
+  const ENV_SECURITY_REFRESH_MS = 30000; // 后台定时刷新间隔，保持状态最新
 
-    if (passwordSet) {
+  function _refreshEnvSecurityCache(force) {
+    if (_envSecurityFetching) return Promise.resolve(_envSecurityCache);
+    if (!force && _envSecurityCache && (Date.now() - _envSecurityCache.at) < ENV_SECURITY_CACHE_TTL) {
+      return Promise.resolve(_envSecurityCache);
+    }
+    _envSecurityFetching = true;
+    return getJSON('/api/env/security-status?_=' + Date.now())
+      .then(function (st) {
+        if (st && st.ok) {
+          _envSecurityCache = {
+            is_public: !!st.is_public,
+            password_set: !!st.password_set,
+            at: Date.now()
+          };
+          state.envIsPublic = _envSecurityCache.is_public;
+          state.envPasswordSet = _envSecurityCache.password_set;
+        }
+        return _envSecurityCache;
+      })
+      .catch(function (e) {
+        console.warn('[env安全] 安全检测失败，按未设密码处理', e);
+        return _envSecurityCache;
+      })
+      .finally(function () { _envSecurityFetching = false; });
+  }
+
+  function _decideEnvSecurityGate(st, onOpen) {
+    st = st || {};
+    if (st.password_set) {
       // 已配置密码 → 输入密码才能修改
       requirePasswordToOpen(onOpen);
-    } else if (isPublic) {
+    } else if (st.is_public) {
       // 公网且未设密码 → 强制设置安全密码（二次确认）
       forceSetPassword(onOpen);
     } else {
       // 局域网 / localhost → 跳过安全检测，直接打开
       onOpen();
     }
+  }
+
+  function openEnvSettingsWithSecurity(onOpen) {
+    const cached = _envSecurityCache;
+    if (cached) {
+      // 命中缓存：立即打开（零延迟）
+      _decideEnvSecurityGate(cached, onOpen);
+      // 后台静默刷新，确保下次仍是最新状态
+      _refreshEnvSecurityCache(true);
+      return;
+    }
+    // 极少数冷启动点击（页面刚加载、预取尚未返回）：等待一次快速检测后打开
+    _refreshEnvSecurityCache(false).then(function (st) {
+      _decideEnvSecurityGate(st || {}, onOpen);
+    });
   }
 
   // ===== 环境变量设置模态框 =====
@@ -11756,6 +11941,14 @@ function renderFilters() {
     const closeBtn = document.getElementById('closeEnvSettingsBtn');
     const saveBtn = document.getElementById('envSettingsSaveBtn');
     if (!modal || !openBtn) return;
+
+    // ★ 修复：页面加载时立即预取安全检测结果，并后台定时刷新，
+    //   保证用户点击 ⚙️ 时缓存已就绪 → 弹窗即刻显示。
+    _refreshEnvSecurityCache(false);
+    if (window._envSecurityRefreshTimer) clearInterval(window._envSecurityRefreshTimer);
+    window._envSecurityRefreshTimer = setInterval(function () {
+      if (!document.hidden) _refreshEnvSecurityCache(false);
+    }, ENV_SECURITY_REFRESH_MS);
 
     function open() {
       modal.classList.add('open');
@@ -12227,6 +12420,7 @@ function renderFilters() {
     if (refreshTimer) clearTimeout(refreshTimer);
     if (goEasyInitTimer) clearTimeout(goEasyInitTimer);
     if (presenceRefreshTimer) clearInterval(presenceRefreshTimer);
+    if (window._envSecurityRefreshTimer) { clearInterval(window._envSecurityRefreshTimer); window._envSecurityRefreshTimer = null; }
   });
 
 

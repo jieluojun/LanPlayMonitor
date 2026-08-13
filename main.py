@@ -1068,13 +1068,19 @@ def ensure_env_config() -> str:
 
 
 def load_env_config() -> dict[str, Any]:
-    """读取环境变量配置；文件缺失时自动创建。"""
-    ensure_env_config()
+    """读取环境变量配置；文件不存在时返回默认值，但**不自动创建** env.json。
+
+    按需求：env.json 只在「设置安全密码」或「保存环境变量」时才生成，
+    纯读取路径（启动、安全检测、上传前刷新等）一律不落盘。
+    """
     try:
         data = json.loads(Path(ENV_CONFIG_FILE).read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
         warn("[env配置] 配置文件格式不是对象，使用默认值")
+    except FileNotFoundError:
+        # 文件未生成：返回默认配置，不创建文件
+        return copy.deepcopy(DEFAULT_ENV_CONFIG)
     except Exception as exc:
         err(f"[env配置] 读取配置文件失败: {exc}")
     return copy.deepcopy(DEFAULT_ENV_CONFIG)
@@ -1125,6 +1131,32 @@ def apply_r2_config_to_runtime(cfg: dict[str, Any]) -> None:
     CF_API_TOKEN = str(r2.get("cf_api_token", "") or "").strip()
 
 
+# env.json 上次应用的时间戳（mtime_ns），用于检测文件是否被外部移动/恢复/编辑
+_env_config_applied_mtime: int | None = None
+
+
+def reload_r2_config_if_changed() -> None:
+    """若 env.json 在磁盘上被外部改动（移动后再放回、编辑等），重新应用到运行时。
+
+    问题背景：R2 凭据存放在模块级全局变量中，原本只在进程启动时
+    （main 里 apply_r2_config_to_runtime）和应用内保存（/api/env/save）时更新。
+    一旦 env.json 被移出再放回，运行时的 R2 全局仍是旧的空值，
+    导致聊天/头像上传全部失败，直到重启或重新保存。
+    此函数以文件 mtime 为指纹，检测到变化即重新读取并应用。
+    """
+    global _env_config_applied_mtime
+    path = Path(ENV_CONFIG_FILE)
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if mtime is not None and mtime == _env_config_applied_mtime:
+        return  # 未变化，跳过磁盘读取与应用
+    cfg = load_env_config()
+    apply_r2_config_to_runtime(cfg)
+    _env_config_applied_mtime = mtime
+
+
 def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     """合并并保存环境变量配置（支持任意顶层键，包括 security），随后把 R2 配置应用到运行时。"""
     ensure_env_config()
@@ -1154,6 +1186,13 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     # 应用 R2 配置
     if "cloudflare_r2" in existing:
         apply_r2_config_to_runtime(existing)
+
+    # 记录本次应用后的文件 mtime，避免紧接着的上传重复读取磁盘
+    global _env_config_applied_mtime
+    try:
+        _env_config_applied_mtime = Path(ENV_CONFIG_FILE).stat().st_mtime_ns
+    except OSError:
+        _env_config_applied_mtime = None
 
     info(f"[env配置] 环境变量配置已保存并应用: {ENV_CONFIG_FILE}")
     return existing
@@ -3344,6 +3383,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
             # ---- 用户头像上传 → R2 稳定对象键（同一 userId 永久覆盖同一路径） ----
             if path == "/api/avatar/upload":
                 try:
+                    # ★ 先按磁盘上的 env.json 刷新运行时 R2 配置，
+                    #   避免 env.json 被移出再放回后运行时的旧空凭据导致上传失败。
+                    reload_r2_config_if_changed()
                     missing_r2 = []
                     if not R2_ACCOUNT_ID: missing_r2.append("account_id")
                     if not R2_ACCESS_KEY_ID: missing_r2.append("access_key_id")
@@ -3423,6 +3465,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
             # ---- 聊天媒体上传 → Cloudflare R2 ----
             if path == "/api/upload":
                 try:
+                    # ★ 先按磁盘上的 env.json 刷新运行时 R2 配置（同上，兼容外部恢复文件）。
+                    reload_r2_config_if_changed()
                     missing_r2 = []
                     if not R2_ACCOUNT_ID: missing_r2.append("account_id")
                     if not R2_ACCESS_KEY_ID: missing_r2.append("access_key_id")
@@ -3941,9 +3985,7 @@ def main() -> None:
         gc.freeze()  # 把启动期常驻对象移出 GC 扫描范围，永久降低每次 GC 成本
     threading.Thread(target=_memory_watchdog, daemon=True, name="mem-watchdog").start()
     ensure_frontend_exists()
-    ensure_env_config()          # 若 env.json 不存在则自动创建空配置
-    # 若存在旧的 security.json 需要迁移，可取消下面一行的注释
-    # migrate_security_from_old_file()
+    # 不再启动时自动创建 env.json；文件仅在「设置安全密码 / 保存环境变量」时生成。
     runtime_env_config = load_env_config()
     apply_r2_config_to_runtime(runtime_env_config)
     ctx.refresh_config(force=True)
