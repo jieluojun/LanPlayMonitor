@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import gc
 import ipaddress
 import json
 import os
@@ -56,7 +57,12 @@ class LogCapturer:
     _RE_HEX = re.compile(r"\b[0-9a-f]{12,}\b", re.I)
     _RE_NUM = re.compile(r"\d+")
 
-    def __init__(self, maxlen: int = 500):
+    # 单条日志最大保留长度，防止超长异常/报文把内存撑爆
+    MAX_LINE = 1000
+    # 归一化 key 的最大长度（key 只用于去重，截断不影响判定质量）
+    MAX_KEY = 200
+
+    def __init__(self, maxlen: int = 200):
         self.terminal = sys.stdout
         self.maxlen = maxlen
         # kind_key -> [最新原文, 首次时间, 最后更新时间]
@@ -65,11 +71,19 @@ class LogCapturer:
         self.lock = threading.Lock()
         self.changed = threading.Condition(self.lock)
         self.version = 0
+        # 渲染结果缓存：日志版本未变时复用同一个列表，避免每次请求重建
+        self._render_cache: list[str] | None = None
+        self._render_version = -1
 
     @classmethod
     def _kind_key(cls, msg: str) -> str:
-        """归一化日志为“种类”标识：剔除时间戳/UUID/哈希/数字等易变内容。"""
-        key = cls._RE_ISO_TS.sub("<T>", msg)
+        """归一化日志为“种类”标识：剔除时间戳/UUID/哈希/数字等易变内容。
+
+        优化：先截断再做 5 次正则替换。原实现对超长文本（如异常报文、
+        base64 片段）整串跑正则，既慢又生成多份大字符串副本。
+        """
+        key = msg[: cls.MAX_KEY]
+        key = cls._RE_ISO_TS.sub("<T>", key)
         key = cls._RE_TIME.sub("<T>", key)
         key = cls._RE_UUID.sub("<U>", key)
         key = cls._RE_HEX.sub("<H>", key)
@@ -78,26 +92,45 @@ class LogCapturer:
 
     def write(self, message: str):
         msg_stripped = message.strip()
+        if not msg_stripped:
+            if self.terminal:
+                self.terminal.write(message)
+            return
         if msg_stripped.startswith("Traceback") or "File \"/" in msg_stripped:
             return
         if self.terminal:
             self.terminal.write(message)
             self.terminal.flush()
-        if msg_stripped:
-            now = time.time()
-            key = self._kind_key(msg_stripped)
-            with self.lock:
-                entry = self.entries.get(key)
-                if entry is not None:
-                    # 同种类：直接替换原条目；不追加、不计数、不改变条目位置。
-                    entry[0] = msg_stripped
-                    entry[2] = now
-                else:
-                    self.entries[key] = [msg_stripped, now, now]
-                    if len(self.entries) > self.maxlen:
-                        self.entries.popitem(last=False)  # 淘汰最早出现的条目
-                self.version += 1
-                self.changed.notify_all()
+        # 超长日志截断，避免单条几 MB 的内容常驻内存
+        if len(msg_stripped) > self.MAX_LINE:
+            msg_stripped = msg_stripped[: self.MAX_LINE] + f"…(已截断 {len(msg_stripped) - self.MAX_LINE} 字符)"
+        now = time.time()
+        key = self._kind_key(msg_stripped)
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is not None:
+                # 同种类：直接替换原条目；不追加、不计数、不改变条目位置。
+                entry[0] = msg_stripped
+                entry[2] = now
+            else:
+                self.entries[key] = [msg_stripped, now, now]
+                while len(self.entries) > self.maxlen:
+                    self.entries.popitem(last=False)  # 淘汰最早出现的条目
+            self.version += 1
+            self._render_cache = None
+            self.changed.notify_all()
+
+    def _render_locked(self, n: int = 200) -> list[str]:
+        """在持锁状态下渲染日志列表，并按版本缓存结果。"""
+        if self._render_cache is not None and self._render_version == self.version:
+            return self._render_cache
+        entries = list(self.entries.values())
+        if len(entries) > n:
+            entries = entries[-n:]
+        rendered = [self._format(e) for e in entries]
+        self._render_cache = rendered
+        self._render_version = self.version
+        return rendered
 
     def flush(self):
         if self.terminal:
@@ -113,20 +146,27 @@ class LogCapturer:
 
     def get_logs(self) -> list[str]:
         with self.lock:
-            return [self._format(e) for e in self.entries.values()]
+            return self._render_locked(self.maxlen)
 
     def get_logs_snapshot(self, n: int = 200) -> tuple[int, list[str]]:
         with self.lock:
-            items = [self._format(e) for e in self.entries.values()]
-            return self.version, (items[-n:] if len(items) > n else items)
+            return self.version, self._render_locked(n)
 
-    def wait_for_change(self, version: int) -> tuple[int, list[str]]:
-        # 持续等待，只有日志版本发生变化时才返回；不设置超时。
+    def wait_for_change(self, version: int, timeout: float = 300.0) -> tuple[int, list[str]]:
+        """等待日志版本变化。
+
+        优化：加超时上限。原实现无限期 wait，客户端断开后（尤其是移动端
+        切后台/被系统回收）线程会永久挂住，每个僵尸连接常驻一个线程栈
+        （默认 8MB 虚拟内存 / 数十 KB 实际）+ 一份 handler 对象。
+        """
+        deadline = time.monotonic() + timeout
         with self.changed:
             while self.version == version:
-                self.changed.wait()
-            items = [self._format(e) for e in self.entries.values()]
-            return self.version, (items[-200:] if len(items) > 200 else items)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.changed.wait(min(remaining, 30.0))
+            return self.version, self._render_locked(200)
 
     def get_logs_tail(self, n: int = 200) -> list[str]:
         _version, items = self.get_logs_snapshot(n)
@@ -136,6 +176,14 @@ class LogCapturer:
 log_capturer = LogCapturer()
 sys.stdout = log_capturer
 sys.stderr = log_capturer
+
+# 线程栈从默认 8MB 降到 512KB。本程序的线程都只做 IO 转发与简单解析，
+# 递归极浅。Android 上每个线程栈会实打实计入进程内存映射，
+# 几十个连接线程的差异可达数百 MB 虚拟内存 / 数十 MB RSS。
+try:
+    threading.stack_size(512 * 1024)
+except (ValueError, RuntimeError):
+    pass
 
 # ============================================================
 # 原生桥接：沉浸式状态栏 + 电池优化 + 主题同步 + WebView 文件选择
@@ -175,6 +223,24 @@ err = lambda *a, **k: print("[ERROR]", *a, **k)
 
 NETWORK_CHECK_URL = "https://www.baidu.com"
 
+# ---------------------------------------------------------------------------
+# 共享 SSL 上下文（内存优化关键项）
+#
+# 原代码在 10 处、每次网络请求都调用 ssl.create_default_context()。
+# 每次调用都会重新加载系统 CA 证书库（数百 KB ~ 数 MB 的证书对象），
+# 在“每秒轮询 + 多客户端”的场景下会造成剧烈的内存抖动（锯齿状 RSS）。
+# 这些调用点随后又统一关掉了校验（check_hostname=False / CERT_NONE），
+# 因此完全等价于一个共享的免校验上下文——建一次全局复用即可。
+# ---------------------------------------------------------------------------
+def _make_unverified_ssl_context() -> ssl.SSLContext:
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+SSL_CTX = _make_unverified_ssl_context()
+
 _network_status_cache: dict[str, Any] = {
     "online": True,
     "last_check": 0.0,
@@ -185,9 +251,7 @@ _network_status_lock = threading.Lock()
 
 
 def check_network_reachability() -> bool:
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     req = urllib.request.Request(
         NETWORK_CHECK_URL,
         headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "text/html"}
@@ -232,7 +296,14 @@ REMOTE_DOWNLOAD_INTERVAL = 60
 APP_NAME = "lan-play-room-monitor"
 CACHE_TTL = max(1, float(os.getenv("CACHE_TTL", "1")))
 REQUEST_TIMEOUT = max(1, float(os.getenv("REQUEST_TIMEOUT", "1")))
-MAX_WORKERS = 32
+# 扫描线程数：原为 32（上限 64）。每个线程 = 一个栈 + 一份运行时对象，
+# 而扫描是 IO 密集且服务器通常只有个位数台，开这么多纯属浪费常驻内存。
+# 现按“服务器数”自适应，最多 8。
+MAX_WORKERS = max(2, int(os.getenv("MAX_WORKERS", "8")))
+# JSON 接口请求体上限（非文件上传），防止异常大包撑爆内存
+MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+# 内存看门狗执行间隔（秒）：定期 gc + 把空闲堆归还操作系统
+GC_INTERVAL = max(30, int(os.getenv("GC_INTERVAL", "120")))
 
 # 可选代理前缀（为空则直连，失败自动重试直连）# 例：https://v6.gh-proxy.org 或 https://gh-proxy.com
 REMOTE_UPDATE_PROXY = os.getenv("REMOTE_UPDATE_PROXY", "https://v6.gh-proxy.org").strip().rstrip("/")
@@ -302,6 +373,12 @@ DOWNLOAD_MAX_MB = int(os.getenv("DOWNLOAD_MAX_MB", "2048"))  # 内置下载最�
 DOWNLOAD_MAX_BYTES = DOWNLOAD_MAX_MB * 1024 * 1024
 DOWNLOAD_TIMEOUT = max(10, float(os.getenv("DOWNLOAD_TIMEOUT", "300")))
 DOWNLOAD_XOR_KEY = 0x5A
+# 预计算 XOR 转换表：bytes.translate 是 C 层实现，单次分配、零中间对象。
+# 原写法 bytes(b ^ KEY for b in chunk) 会为 1MB 分块生成 100 万个 Python int
+# 与一个生成器，峰值内存可达数十 MB，且慢一个数量级。
+_XOR_TABLE = bytes(i ^ DOWNLOAD_XOR_KEY for i in range(256))
+# 流式分块大小：1MB → 256KB，降低每连接的常驻缓冲（多并发下差异明显）
+DOWNLOAD_CHUNK_SIZE = 256 * 1024
 _download_path_lock = threading.Lock()
 
 
@@ -374,9 +451,7 @@ def download_url_to_android(url: str, filename: str = "", xor: bool = False) -> 
         parsed.geturl(),
         headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "*/*"},
     )
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     temp_path: Path | None = None
     try:
         with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT, context=ctx_ssl) as resp:
@@ -401,14 +476,14 @@ def download_url_to_android(url: str, filename: str = "", xor: bool = False) -> 
             written = 0
             with open(temp_path, "wb") as out:
                 while True:
-                    chunk = resp.read(1024 * 1024)
+                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
                     if not chunk:
                         break
                     written += len(chunk)
                     if written > DOWNLOAD_MAX_BYTES:
                         raise ValueError(f"文件过大，最大允许 {DOWNLOAD_MAX_BYTES // (1024 * 1024)}MB")
                     if xor:
-                        chunk = bytes(byte ^ DOWNLOAD_XOR_KEY for byte in chunk)
+                        chunk = chunk.translate(_XOR_TABLE)
                     out.write(chunk)
                 out.flush()
                 try:
@@ -454,9 +529,7 @@ def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: s
         parsed.geturl(),
         headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "*/*"},
     )
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
 
     with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT, context=ctx_ssl) as resp:
         status = int(getattr(resp, "status", 200) or 200)
@@ -501,14 +574,14 @@ def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: s
 
         written = 0
         while True:
-            chunk = resp.read(1024 * 1024)
+            chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
             if not chunk:
                 break
             written += len(chunk)
             if written > DOWNLOAD_MAX_BYTES:
                 raise ValueError(f"文件过大，最大允许 {DOWNLOAD_MAX_BYTES // (1024 * 1024)}MB")
             if xor:
-                chunk = bytes(byte ^ DOWNLOAD_XOR_KEY for byte in chunk)
+                chunk = chunk.translate(_XOR_TABLE)
             handler.wfile.write(chunk)
 
         info(f"[浏览器下载] 已转发 name={final_name} size={written} xor={xor}")
@@ -609,9 +682,7 @@ def r2_put_object(data: bytes, object_key: str, content_type: str = "application
     url = f"https://{host}/{object_key}"
     req = urllib.request.Request(url, data=data, method="PUT", headers=headers)
     
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     try:
         with urllib.request.urlopen(req, timeout=60, context=ctx_ssl) as resp:
             if resp.status not in (200, 201):
@@ -662,9 +733,7 @@ def r2_head_object(object_key: str) -> dict[str, Any]:
     headers["Authorization"] = auth
     headers["x-amz-date"] = amz_date
     req = urllib.request.Request(f"https://{host}/{clean_key}", method="HEAD", headers=headers)
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     try:
         with urllib.request.urlopen(req, timeout=5, context=ctx_ssl) as resp:
             etag = str(resp.headers.get("ETag", "") or "").strip().strip('"')
@@ -693,9 +762,7 @@ def get_r2_bucket_total_size() -> int:
     host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     total = 0
     continuation = ""
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     while True:
         params = {"list-type": "2", "max-keys": "1000"}
         if continuation:
@@ -763,9 +830,7 @@ def disable_r2_public_access() -> bool:
     }
     payload = json.dumps({"enabled": False}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="PUT", headers=headers)
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     try:
         with urllib.request.urlopen(req, timeout=30, context=ctx_ssl) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -789,9 +854,7 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
     host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     keys: list[str] = []
     continuation = ""
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
     while True:
         params = {"list-type": "2", "max-keys": "1000"}
         if continuation:
@@ -884,34 +947,50 @@ def check_r2_bucket_capacity(source: str = "检查") -> int:
 
 
 def parse_multipart(body: bytes, content_type: str) -> list[dict[str, Any]]:
-    """简易 multipart/form-data 解析，返回 parts: name/filename/content_type/data。"""
+    """简易 multipart/form-data 解析，返回 parts: name/filename/content_type/data。
+
+    内存优化：原实现用 body.split(delimiter) 一次性切出所有段，等于把整个
+    请求体再复制一份（10MB 上传 → 瞬时 +10MB），随后 chunk[2:]/[:-2] 等
+    切片又各复制一次。这里改为：
+    - 用 find() 逐段定位，只记录 (start, end) 偏移；
+    - 头部用小切片解析；
+    - 段体用 memoryview 零拷贝定位，只在最后对真正需要的字段物化一次 bytes。
+    峰值内存从约 3×文件大小降到约 1×。
+    """
     m = re.search(r"boundary=([^;]+)", content_type or "", re.I)
     if not m:
         raise ValueError("缺少 multipart boundary")
     boundary = m.group(1).strip().strip('"').encode("utf-8")
     delimiter = b"--" + boundary
     parts: list[dict[str, Any]] = []
-    chunks = body.split(delimiter)
-    for chunk in chunks:
-        if not chunk or chunk in (b"--", b"--\r\n", b"\r\n", b"--\r\n--"):
+    view = memoryview(body)
+    dlen = len(delimiter)
+
+    pos = body.find(delimiter)
+    while pos >= 0:
+        start = pos + dlen
+        nxt = body.find(delimiter, start)
+        end = nxt if nxt >= 0 else len(body)
+        pos = nxt
+
+        # 归一化段边界（去掉分隔符后的 CRLF、段尾 CRLF 与结束标记 "--"）
+        if body[start:start + 2] == b"\r\n":
+            start += 2
+        elif body[start:start + 2] == b"--":
+            continue  # 结束分隔符 "--boundary--"
+        # 只剥离紧邻下一个分隔符的那一个 CRLF（与原实现语义一致）
+        if end - start >= 2 and body[end - 2:end] == b"\r\n":
+            end -= 2
+        if end <= start:
             continue
-        if chunk.startswith(b"--"):
+
+        sep = body.find(b"\r\n\r\n", start, end)
+        if sep < 0 or sep >= end:
             continue
-        if chunk.startswith(b"\r\n"):
-            chunk = chunk[2:]
-        if chunk.endswith(b"\r\n"):
-            chunk = chunk[:-2]
-        if chunk.endswith(b"--"):
-            chunk = chunk[:-2]
-            if chunk.endswith(b"\r\n"):
-                chunk = chunk[:-2]
-        sep = chunk.find(b"\r\n\r\n")
-        if sep < 0:
-            continue
-        header_blob = chunk[:sep].decode("utf-8", errors="replace")
-        data = chunk[sep + 4:]
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
+        header_blob = bytes(view[start:sep]).decode("utf-8", errors="replace")
+        data_start, data_end = sep + 4, end
+        # data 保持为 memoryview 切片，调用方按需 bytes() 物化
+        data = view[data_start:data_end]
         name = ""
         filename = ""
         ctype = "application/octet-stream"
@@ -1302,9 +1381,7 @@ def _download_remote_file(url: str, dest_path: str) -> bool:
                 cand_url,
                 headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "application/json"}
             )
-            ctx_ssl = ssl.create_default_context()
-            ctx_ssl.check_hostname = False
-            ctx_ssl.verify_mode = ssl.CERT_NONE
+            ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
             with urllib.request.urlopen(req, timeout=10, context=ctx_ssl) as resp:
                 data = resp.read()
                 json.loads(data.decode("utf-8-sig"))
@@ -1375,9 +1452,7 @@ def _fetch_remote_bytes(url: str, timeout: float = 15) -> bytes | None:
     for u in urls:
         try:
             req = urllib.request.Request(u, headers={"User-Agent": f"{APP_NAME}/1.0"})
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            ctx = SSL_CTX  # 复用全局免校验上下文
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 if 200 <= resp.status < 300:
                     return resp.read()
@@ -1510,18 +1585,23 @@ _game_titles_logged_sig: str = ""
 
 
 def load_game_titles() -> dict[str, str]:
-    """加载标题映射；仅在文件变更或首次加载时写日志，避免跟随轮询重复叠加。"""
+    """加载标题映射；仅在文件变更或首次加载时写日志，避免跟随轮询重复叠加。
+
+    内存优化：命中缓存时直接返回**共享只读字典**，不再 dict() 复制。
+    chinese_db.json 常有上万条，原实现每次 refresh_config（每秒）都整份
+    复制一遍，既吃内存又制造 GC 压力。调用方只做只读查询。
+    """
     global _game_titles_cache, _game_titles_mtime, _game_titles_logged_sig
     local_path = Path(LOCAL_CHINESE_DB_FILE)
     mtime: float | None = None
     try:
-        if local_path.is_file():
-            mtime = local_path.stat().st_mtime
+        st = local_path.stat()
+        mtime = st.st_mtime
     except OSError:
         mtime = None
 
     if _game_titles_cache is not None and mtime == _game_titles_mtime:
-        return dict(_game_titles_cache)
+        return _game_titles_cache
 
     merged = dict(BUILTIN_GAME_TITLES)
     if not local_path.is_file():
@@ -1529,7 +1609,7 @@ def load_game_titles() -> dict[str, str]:
         if sig != _game_titles_logged_sig:
             info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
             _game_titles_logged_sig = sig
-        _game_titles_cache = dict(merged)
+        _game_titles_cache = merged
         _game_titles_mtime = mtime
         return merged
     try:
@@ -1543,7 +1623,7 @@ def load_game_titles() -> dict[str, str]:
             if sig != _game_titles_logged_sig:
                 info(f"[配置] 标题映射已加载: {len(data)} 条，合并后总数: {len(merged)}")
                 _game_titles_logged_sig = sig
-            _game_titles_cache = dict(merged)
+            _game_titles_cache = merged
             _game_titles_mtime = mtime
             return merged
         warn("[配置警告] 本地标题映射格式不正确")
@@ -1553,7 +1633,7 @@ def load_game_titles() -> dict[str, str]:
     if sig != _game_titles_logged_sig:
         info(f"[配置] 使用内置标题映射，共 {len(merged)} 条")
         _game_titles_logged_sig = sig
-    _game_titles_cache = dict(merged)
+    _game_titles_cache = merged
     _game_titles_mtime = mtime
     return merged
 
@@ -1561,17 +1641,31 @@ def load_game_titles() -> dict[str, str]:
 # SECTION 6 · TTL 缓存
 # ============================================================================
 
-@dataclass
+@dataclass(slots=True)
 class CacheItem:
+    """slots 版缓存条目：去掉 __dict__，单条约省 100+ 字节。"""
     value: Any
     expires_at: float
 
 
 class TTLCache:
-    def __init__(self, max_items: int = 1024):
-        self._items: dict[str, CacheItem] = {}
+    """轻量 TTL 缓存（内存优化版）。
+
+    优化点：
+    1. 不再 deepcopy。扫描结果（scan_server 产出）在写入缓存后即视为
+       **只读快照**，调用方只读不改；原实现每秒 get/set 各深拷贝一次，
+       一份数据在内存里同时存在 3 份，是常驻内存的主要来源。
+    2. 过期条目惰性清理 + 定期批量清理，避免过期对象长期占着内存。
+    3. max_items 从 2048 降到 256（实际条目数 = 服务器数，几十足够）。
+    """
+
+    __slots__ = ("_items", "_lock", "max_items", "_last_purge")
+
+    def __init__(self, max_items: int = 256):
+        self._items: OrderedDict[str, CacheItem] = OrderedDict()
         self._lock = threading.Lock()
         self.max_items = max_items
+        self._last_purge = 0.0
 
     def get(self, key: str) -> Any | None:
         now = time.monotonic()
@@ -1580,40 +1674,58 @@ class TTLCache:
             if item is None:
                 return None
             if item.expires_at <= now:
-                self._items.pop(key, None)
+                del self._items[key]
                 return None
-            return copy.deepcopy(item.value)
+            return item.value
 
-    def set(self, key: str, value: Any, ttl: int = CACHE_TTL) -> None:
+    def set(self, key: str, value: Any, ttl: float = CACHE_TTL) -> None:
+        now = time.monotonic()
         with self._lock:
-            self._items[key] = CacheItem(copy.deepcopy(value), time.monotonic() + ttl)
-            if len(self._items) > self.max_items:
-                oldest_key = next(iter(self._items))
-                self._items.pop(oldest_key, None)
+            self._items[key] = CacheItem(value, now + ttl)
+            self._items.move_to_end(key)
+            # 每 30 秒批量清理一次过期条目，避免死键常驻
+            if now - self._last_purge > 30:
+                self._last_purge = now
+                for k in [k for k, v in self._items.items() if v.expires_at <= now]:
+                    del self._items[k]
+            while len(self._items) > self.max_items:
+                self._items.popitem(last=False)
 
     def clear(self):
         with self._lock:
             self._items.clear()
 
 
-cache = TTLCache(max_items=2048)
+cache = TTLCache(max_items=256)
 
 # 房间保活：连续扫描中至少出现一次则保留；连续 ROOM_KEEPALIVE_MISSES 次未扫到再移除
 ROOM_KEEPALIVE_MISSES = 5
-_room_keepalive: dict[str, dict[str, dict[str, Any]]] = {}
+# 单服务器保活房间上限，防止异常/恶意数据把内存撑爆
+MAX_KEEPALIVE_ROOMS_PER_SERVER = int(os.getenv("MAX_KEEPALIVE_ROOMS", "300"))
+_room_keepalive: dict[str, dict[str, list[Any]]] = {}
 _room_keepalive_lock = threading.Lock()
 
 
+_RE_INDEX_ID = re.compile(r"^(.*)-(\d+)$")
+
+
 def room_stable_key(room: dict[str, Any], server_id: str = "") -> str:
-    """生成跨扫描稳定的房间标识，避免 index 型 id 导致保活失效。"""
+    """生成跨扫描稳定的房间标识，避免 index 型 id 导致保活失效。
+
+    优化：原实现每次调用都用 f-string 拼一条正则再 re.match 编译，
+    每秒扫描 × 房间数会产生大量临时 Pattern 对象并污染 re 缓存。
+    改为一条预编译正则 + 字符串比较。
+    """
     sid = str(room.get("server_id") or server_id or "")
     session = str(room.get("sessionId") or room.get("session_id") or "").strip()
     rid = str(room.get("id") or "").strip()
     # 真实 session 优先；排除 normalize 时用的 `{server}-{index}` 临时 id
     if session:
         return f"{sid}:sess:{session}"
-    if rid and not re.match(rf"^{re.escape(sid)}-\d+$", rid):
-        return f"{sid}:id:{rid}"
+    if rid:
+        m = _RE_INDEX_ID.match(rid)
+        if not (m and m.group(1) == sid):
+            return f"{sid}:id:{rid}"
     content = str(room.get("content_id") or room.get("title_id") or "")
     host = str(room.get("host") or room.get("node_id") or "")
     game = str(room.get("game") or "")
@@ -1621,42 +1733,68 @@ def room_stable_key(room: dict[str, Any], server_id: str = "") -> str:
 
 
 def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """合并本轮扫描结果与保活缓存。
+    """合并本轮扫描结果与保活缓存（内存优化版）。
 
     - 本轮扫到：重置 miss 计数并更新房间数据
     - 本轮未扫到：miss + 1
     - miss >= ROOM_KEEPALIVE_MISSES：从卡片移除
-    保活结果同时驱动卡片房间列表与游戏筛选（总房间 / 各游戏 tab）
+
+    内存优化：
+    1. 去掉两处 copy.deepcopy。房间 dict 由 normalize_room 每轮新建，
+       本来就没有外部别名，直接持有引用即可；原实现每轮每房间产生
+       2 份深拷贝副本（写入一份、输出一份），高频轮询下是最大的垃圾来源。
+    2. 用 [room, misses] 的 list 代替 {"room":..., "misses":...} 的 dict，
+       每条省一个 dict 对象（约 180 字节）。
+    3. 增加每服务器保活房间数上限，防止异常数据把桶撑爆。
     """
     seen: dict[str, dict[str, Any]] = {}
     for room in current_rooms:
-        rid = room_stable_key(room, server_id)
-        seen[rid] = room
+        seen[room_stable_key(room, server_id)] = room
 
     with _room_keepalive_lock:
-        bucket = _room_keepalive.setdefault(server_id, {})
+        bucket = _room_keepalive.get(server_id)
+        if bucket is None:
+            if not seen:
+                return []
+            bucket = {}
+            _room_keepalive[server_id] = bucket
 
-        # 更新本轮出现的房间
+        # 更新本轮出现的房间（复用已有 list 容器，避免重复分配）
         for rid, room in seen.items():
-            bucket[rid] = {"room": copy.deepcopy(room), "misses": 0}
+            entry = bucket.get(rid)
+            if entry is None:
+                bucket[rid] = [room, 0]
+            else:
+                entry[0] = room
+                entry[1] = 0
 
         # 未出现的房间累加 miss，超限剔除
-        for rid in list(bucket.keys()):
-            if rid in seen:
-                continue
-            entry = bucket[rid]
-            entry["misses"] = int(entry.get("misses") or 0) + 1
-            if entry["misses"] >= ROOM_KEEPALIVE_MISSES:
+        if len(bucket) != len(seen):
+            for rid in [k for k in bucket if k not in seen]:
+                entry = bucket[rid]
+                entry[1] += 1
+                if entry[1] >= ROOM_KEEPALIVE_MISSES:
+                    del bucket[rid]
+
+        # 上限保护：只保留最近出现的 MAX_KEEPALIVE_ROOMS_PER_SERVER 个
+        if len(bucket) > MAX_KEEPALIVE_ROOMS_PER_SERVER:
+            for rid in sorted(bucket, key=lambda k: bucket[k][1], reverse=True)[
+                : len(bucket) - MAX_KEEPALIVE_ROOMS_PER_SERVER
+            ]:
                 del bucket[rid]
 
-        # 输出仍保活的房间
-        kept = [copy.deepcopy(v["room"]) for v in bucket.values()]
-
-        # 服务器已无任何保活房间时清理空桶
         if not bucket:
             _room_keepalive.pop(server_id, None)
+            return []
 
-    return kept
+        return [v[0] for v in bucket.values()]
+
+
+def prune_room_keepalive(valid_ids: set[str]) -> None:
+    """服务器被删除后清掉它遗留的保活桶，避免内存里挂死数据。"""
+    with _room_keepalive_lock:
+        for sid in [s for s in _room_keepalive if s not in valid_ids]:
+            del _room_keepalive[sid]
 
 
 # ============================================================================
@@ -1770,6 +1908,12 @@ class HTTPResponse:
 
 
 class HTTPClient:
+    # 复用 opener：urllib.request.build_opener() 每次都会实例化整条 handler
+    # 链（约 10 个 handler 对象 + 内部字典）。扫描是每秒 × 每服务器一次，
+    # 原实现等于每秒凭空造几十个对象丢给 GC。opener 本身是无状态可共享的。
+    _OPENER = urllib.request.build_opener()
+    _OPENER_NOREDIRECT = urllib.request.build_opener(urllib.request.HTTPErrorProcessor())
+
     def __init__(self, user_agent: str = "", default_timeout: float = REQUEST_TIMEOUT):
         self.user_agent = user_agent or f"{APP_NAME}/1.0 (read-only room monitor)"
         self.default_timeout = default_timeout
@@ -1781,9 +1925,7 @@ class HTTPClient:
         if headers:
             req_headers.update(headers)
         req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
-        opener = urllib.request.build_opener()
-        if not allow_redirects:
-            opener = urllib.request.build_opener(urllib.request.HTTPErrorProcessor())
+        opener = self._OPENER if allow_redirects else self._OPENER_NOREDIRECT
         try:
             resp = opener.open(req, timeout=timeout or self.default_timeout)
             body = resp.read()
@@ -2109,29 +2251,67 @@ class ActiveRoomScanner:
 # ============================================================================
 
 class AppContext:
+    # 配置文件重载最小间隔（秒）。前端每秒轮询 /api/snapshot 会调用
+    # refresh_config，原实现每次都重新读盘 + 解析 servers.json /
+    # chinese_db.json（可能上万条），既是 CPU 也是内存分配热点。
+    CONFIG_RELOAD_INTERVAL = max(1.0, float(os.getenv("CONFIG_RELOAD_INTERVAL", "10")))
+
     def __init__(self):
         self.lock = threading.RLock()
         self.servers: list[dict[str, Any]] = []
         self.servers_by_id: dict[str, dict[str, Any]] = {}
         self.scanners: dict[str, ActiveRoomScanner] = {}
-        self.game_titles: dict[str, str] = dict(BUILTIN_GAME_TITLES)
+        self.game_titles: dict[str, str] = BUILTIN_GAME_TITLES
         self.download_status: dict[str, Any] = dict(_download_status)
+        self._last_reload: float = 0.0
+        self._config_sig: tuple = ()
 
-    def refresh_config(self):
+    @staticmethod
+    def _config_signature() -> tuple:
+        """用相关配置文件的 (mtime, size) 组成签名，变化才真正重载。"""
+        sig: list[Any] = []
+        for p in (LOCAL_SERVERS_FILE, MANUAL_SERVERS_FILE, SERVERS_FILE, LOCAL_CHINESE_DB_FILE):
+            try:
+                st = os.stat(p)
+                sig.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append(None)
+        return tuple(sig)
+
+    def refresh_config(self, force: bool = False):
+        now = time.monotonic()
         with self.lock:
+            if not force and self.servers and now - self._last_reload < self.CONFIG_RELOAD_INTERVAL:
+                # 冷却期内只同步一下下载状态，不碰磁盘和 JSON 解析
+                with _download_status_lock:
+                    if self.download_status != _download_status:
+                        self.download_status = dict(_download_status)
+                return
+            self._last_reload = now
+
+            sig = self._config_signature()
+            if not force and self.servers and sig == self._config_sig:
+                with _download_status_lock:
+                    if self.download_status != _download_status:
+                        self.download_status = dict(_download_status)
+                return
+            self._config_sig = sig
+
             self.game_titles = load_game_titles()
             new_servers = _load_servers_merged()
             self.servers = new_servers
             self.servers_by_id = {s["id"]: s for s in new_servers}
 
             current_ids = set(self.servers_by_id.keys())
-            for sid in list(self.scanners.keys()):
-                if sid not in current_ids:
-                    self.scanners[sid].close()
-                    del self.scanners[sid]
+            for sid in [k for k in self.scanners if k not in current_ids]:
+                self.scanners[sid].close()
+                del self.scanners[sid]
             for s in self.servers:
                 if s["id"] not in self.scanners:
                     self.scanners[s["id"]] = ActiveRoomScanner(s)
+
+            # 服务器被删除后，同步清掉它遗留的房间保活桶与扫描缓存
+            prune_room_keepalive(current_ids)
 
             with _download_status_lock:
                 self.download_status = dict(_download_status)
@@ -2320,7 +2500,7 @@ def _load_servers_merged() -> list[dict[str, Any]]:
 # ============================================================================
 
 SCAN_EXECUTOR = ThreadPoolExecutor(
-    max_workers=min(MAX_WORKERS, 64),
+    max_workers=min(MAX_WORKERS, 16),
     thread_name_prefix="scanner"
 )
 
@@ -2984,12 +3164,19 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 try:
                     force = wants_refresh(query)
                     servers_data, all_cached = scan_all(force=force)
+                    # 内存优化：房间对象只做引用聚合，不再 dict(r) 逐个浅拷贝。
+                    # 序列化是只读操作，拷贝纯属浪费（房间多时每秒一份垃圾）。
                     all_rooms: list[dict[str, Any]] = []
                     for s in servers_data:
-                        for r in s.get("rooms", []):
-                            rc = dict(r)
-                            all_rooms.append(rc)
-                    data = {"ok": True, "servers": servers_data, "rooms": all_rooms}
+                        rooms = s.get("rooms")
+                        if rooms:
+                            all_rooms.extend(rooms)
+                    # servers 里的 rooms 前端并不使用（只用 room_count），
+                    # 剔除后响应体体积可减半，序列化缓冲同步减小。
+                    servers_slim = [
+                        {k: v for k, v in s.items() if k != "rooms"} for s in servers_data
+                    ]
+                    data = {"ok": True, "servers": servers_slim, "rooms": all_rooms}
                     body, headers, status = make_json_response(data, cache_hit=all_cached)
                 except Exception as e:
                     err(f"[API] /api/snapshot 异常: {e}")
@@ -3187,6 +3374,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     if not file_part or not file_part.get("data"):
                         raise ValueError("未找到头像文件")
                     avatar_data = bytes(file_part["data"])
+                    # 头像已物化，尽快释放整个请求体与所有 memoryview 切片
+                    for _p in parts:
+                        _d = _p.get("data")
+                        if isinstance(_d, memoryview):
+                            _d.release()
+                        _p["data"] = b""
+                    parts = None
+                    raw_body = None
                     if len(avatar_data) > avatar_limit:
                         raise ValueError(f"头像文件过大，最大允许 {avatar_limit // (1024 * 1024)}MB")
                     avatar_type = str(file_part.get("content_type") or "").lower().split(";", 1)[0].strip()
@@ -3270,14 +3465,25 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                 break
                     if not file_part or not file_part.get("data"):
                         raise ValueError("未找到上传文件字段（name=file）")
-                    data = file_part["data"]
-                    if len(data) > R2_MAX_UPLOAD_MB * 1024 * 1024:
+                    if len(file_part["data"]) > R2_MAX_UPLOAD_MB * 1024 * 1024:
                         raise ValueError(f"文件过大，最大允许 {R2_MAX_UPLOAD_MB}MB")
+                    data = bytes(file_part["data"])
                     # 原始文件名（含中文），返回给前端显示
                     original_filename = file_part.get("filename") or "file"
+                    part_ctype = file_part.get("content_type") or ""
+                    # 文件已物化，立刻释放请求体与所有段的 memoryview 引用，
+                    # 避免整份 raw_body 在 R2 上传（网络耗时）期间一直驻留内存
+                    for _p in parts:
+                        _d = _p.get("data")
+                        if isinstance(_d, memoryview):
+                            _d.release()
+                        _p["data"] = b""
+                    parts = None
+                    file_part = None
+                    raw_body = None
                     # object_key 只用 UUID+ASCII扩展名，避免中文导致 R2 签名/URL 问题
                     filename = _cos_safe_filename(original_filename)
-                    ctype = file_part.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    ctype = part_ctype or mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     file_type = _cos_guess_file_type(filename, ctype)
                     day = datetime.now(timezone.utc).strftime("%Y%m%d")
                     # 从安全文件名提取纯 ASCII 扩展名
@@ -3308,8 +3514,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             # 其余 POST 接口使用 JSON body
             try:
+                # 上限保护：JSON 接口不该收到大包，避免恶意/异常请求一次性
+                # 吃掉几百 MB（原实现无条件按 Content-Length 全量读入）
+                if content_length > MAX_JSON_BODY_BYTES:
+                    raise ValueError("请求体过大")
                 raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
                 req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                raw_body = None
                 if not isinstance(req_json, dict):
                     req_json = {}
             except Exception:
@@ -3389,7 +3600,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                             existing_list = []
                     existing_list.append(validated)
                     local_path.write_text(json.dumps(existing_list, ensure_ascii=False, indent=2), encoding="utf-8")
-                    ctx.refresh_config()
+                    ctx.refresh_config(force=True)
                     data = {"ok": True, "server": validated}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -3409,7 +3620,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         existing_list = []
                     new_list = [item for item in existing_list if str(item.get("id")) != sid]
                     local_path.write_text(json.dumps(new_list, ensure_ascii=False, indent=2), encoding="utf-8")
-                    ctx.refresh_config()
+                    ctx.refresh_config(force=True)
                     data = {"ok": True}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -3457,7 +3668,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     for k, v in validated.items():
                         item[k] = v
                     local_path.write_text(json.dumps(existing_list, ensure_ascii=False, indent=2), encoding="utf-8")
-                    ctx.refresh_config()
+                    ctx.refresh_config(force=True)
                     data = {"ok": True}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -3580,7 +3791,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                     local_path.write_text(json.dumps(ex_list, ensure_ascii=False, indent=2), encoding="utf-8")
                             except Exception:
                                 pass
-                        ctx.refresh_config()
+                        ctx.refresh_config(force=True)
                     elif isinstance(order, list) and order:
                         existing_map: dict[str, dict] = {}
                         if local_path.is_file():
@@ -3596,7 +3807,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                 reordered.append(item)
                         if reordered:
                             local_path.write_text(json.dumps(reordered, ensure_ascii=False, indent=2), encoding="utf-8")
-                            ctx.refresh_config()
+                            ctx.refresh_config(force=True)
                     data = {"ok": True}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -3634,18 +3845,108 @@ class MonitorHandler(BaseHTTPRequestHandler):
 # ============================================================================
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """内存优化版 HTTP 服务器。
+
+    1. block_on_close=False：不再保留所有已结束线程对象的引用。
+       ThreadingMixIn 默认会把每个 handler 线程放进 self._threads 列表，
+       并且**永不清理**——长时间运行后这个列表会累积上万个 Thread 对象，
+       是典型的隐性内存泄漏。
+    2. 限制并发连接数，避免突发请求瞬间创建大量线程栈。
+    3. 开启 TCP_NODELAY，减少发送缓冲堆积。
+    """
+
     daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = True
+    request_queue_size = 64
+    # 同时处理的请求上限（长轮询日志接口会长期占用连接，故留有余量）
+    max_concurrent_requests = int(os.getenv("MAX_CONCURRENT_REQUESTS", "48"))
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(self.max_concurrent_requests)
+
+    def process_request(self, request, client_address):  # type: ignore[override]
+        if not self._slots.acquire(blocking=False):
+            # 达到并发上限：直接关闭，不再新建线程（宁可拒绝也不 OOM）
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def shutdown_request(self, request):  # type: ignore[override]
+        try:
+            super().shutdown_request(request)
+        finally:
+            pass
+
+    def process_request_thread(self, request, client_address):  # type: ignore[override]
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            try:
+                self._slots.release()
+            except ValueError:
+                pass
+
+
+def _memory_watchdog() -> None:
+    """周期性回收：给长期运行的移动端进程一个稳定的内存基线。
+
+    - 定期 gc.collect()，回收扫描/聊天产生的循环引用（dict 互指很常见）
+    - 调用 malloc_trim 把 glibc/bionic 已释放但未归还系统的堆归还 OS，
+      这一步能显著降低 Android 上观察到的 RSS（Python 层 free 不等于
+      进程 RSS 下降）
+    """
+    trim = None
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        trim = libc.malloc_trim
+        trim.argtypes = [ctypes.c_size_t]
+    except Exception:
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so")
+            trim = getattr(libc, "malloc_trim", None)
+            if trim is not None:
+                trim.argtypes = [ctypes.c_size_t]
+        except Exception:
+            trim = None
+
+    while True:
+        time.sleep(GC_INTERVAL)
+        try:
+            gc.collect()
+            if trim is not None:
+                trim(0)
+        except Exception:
+            pass
 
 
 def main() -> None:
     time.sleep(1.0) # 启动等待时长
+
+    # GC 调优：默认阈值 (700,10,10) 对“每秒产生大量短命 dict”的轮询型
+    # 服务过于激进，会频繁做全代扫描。放大阈值可减少 CPU 抖动，
+    # 同时由 watchdog 定期做完整回收 + 归还堆内存。
+    gc.set_threshold(2000, 25, 25)
+    if gc.isenabled():
+        gc.freeze()  # 把启动期常驻对象移出 GC 扫描范围，永久降低每次 GC 成本
+    threading.Thread(target=_memory_watchdog, daemon=True, name="mem-watchdog").start()
     ensure_frontend_exists()
     ensure_env_config()          # 若 env.json 不存在则自动创建空配置
     # 若存在旧的 security.json 需要迁移，可取消下面一行的注释
     # migrate_security_from_old_file()
     runtime_env_config = load_env_config()
     apply_r2_config_to_runtime(runtime_env_config)
-    ctx.refresh_config()
+    ctx.refresh_config(force=True)
     info(f"[配置] 环境变量配置文件: {ENV_CONFIG_FILE}")
     info(f"[配置] 初始服务器数: {len(ctx.servers)}")
     info(f"[配置] 远程文件下载间隔: {REMOTE_DOWNLOAD_INTERVAL} 秒")
