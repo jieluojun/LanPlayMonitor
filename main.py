@@ -367,6 +367,25 @@ except (TypeError, ValueError):
 # Cloudflare API Token（可选，仅从外部配置读取）
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 
+# ---- 腾讯云 COS 存储（与 R2 二选一，由 STORAGE_PROVIDER 决定生效者） ----
+# COS 兼容 S3 XML API 与 AWS Signature V4，可复用下方零依赖签名实现。
+# bucket 需填写「含 APPID 后缀」的完整桶名，例如 mybucket-1250000000；
+# region 例如 ap-guangzhou / ap-shanghai / ap-beijing。
+STORAGE_PROVIDER = (os.getenv("STORAGE_PROVIDER", "r2").strip().lower() or "r2")
+COS_SECRET_ID = os.getenv("COS_SECRET_ID", "").strip()
+COS_SECRET_KEY = os.getenv("COS_SECRET_KEY", "").strip()
+COS_BUCKET = os.getenv("COS_BUCKET", "").strip()
+COS_REGION = os.getenv("COS_REGION", "").strip()
+COS_PUBLIC_URL = os.getenv("COS_PUBLIC_URL", "").strip()  # 可选：CDN/自定义加速域名
+try:
+    COS_MAX_UPLOAD_MB = max(0, int(os.getenv("COS_MAX_UPLOAD_MB", "0") or 0))
+except (TypeError, ValueError):
+    COS_MAX_UPLOAD_MB = 0
+try:
+    COS_MAX_STORAGE_MB = max(0, int(os.getenv("COS_MAX_STORAGE_MB", "0") or 0))
+except (TypeError, ValueError):
+    COS_MAX_STORAGE_MB = 0
+
 # 内置下载器：Android 默认公共下载目录，可通过 DOWNLOAD_DIR 覆盖
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/storage/emulated/0/Download")).expanduser()
 DOWNLOAD_MAX_MB = int(os.getenv("DOWNLOAD_MAX_MB", "2048"))  # 内置下载最大容量（单位：MB，默认 2GB）
@@ -587,18 +606,89 @@ def stream_url_to_browser(handler: BaseHTTPRequestHandler, url: str, filename: s
         info(f"[浏览器下载] 已转发 name={final_name} size={written} xor={xor}")
 
 
+def storage_provider_active() -> str:
+    """当前生效的对象存储提供方：'r2'（Cloudflare R2）或 'cos'（腾讯云 COS）。"""
+    return "cos" if STORAGE_PROVIDER == "cos" else "r2"
+
+
+def storage_label() -> str:
+    """日志/报错用的提供方标签。"""
+    return "COS" if storage_provider_active() == "cos" else "R2"
+
+
+def _storage_sign_params() -> tuple[str, str, str, str]:
+    """返回当前提供方的 (host, region, access_key, secret_key)。
+
+    - R2:  {bucket}.{account_id}.r2.cloudflarestorage.com，region 固定 'auto'
+    - COS: {bucket}.cos.{region}.myqcloud.com（S3 兼容端点），region 为 COS 地域，
+           access_key/secret_key 对应腾讯云 SecretId/SecretKey。
+    COS 的 S3 兼容 API 同样使用 AWS Signature V4，可直接复用下方签名实现。
+    """
+    if storage_provider_active() == "cos":
+        return (
+            f"{COS_BUCKET}.cos.{COS_REGION}.myqcloud.com",
+            COS_REGION,
+            COS_SECRET_ID,
+            COS_SECRET_KEY,
+        )
+    return (
+        f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        "auto",
+        R2_ACCESS_KEY_ID,
+        R2_SECRET_ACCESS_KEY,
+    )
+
+
+def storage_missing_fields() -> list[str]:
+    """当前提供方缺失的必填配置项列表；空列表表示配置完整。"""
+    missing: list[str] = []
+    if storage_provider_active() == "cos":
+        if not COS_SECRET_ID: missing.append("secret_id")
+        if not COS_SECRET_KEY: missing.append("secret_key")
+        if not COS_BUCKET: missing.append("bucket")
+        if not COS_REGION: missing.append("region")
+        if COS_MAX_UPLOAD_MB <= 0: missing.append("max_upload_mb")
+        if COS_MAX_STORAGE_MB <= 0: missing.append("max_storage_mb")
+    else:
+        if not R2_ACCOUNT_ID: missing.append("account_id")
+        if not R2_ACCESS_KEY_ID: missing.append("access_key_id")
+        if not R2_SECRET_ACCESS_KEY: missing.append("secret_access_key")
+        if not R2_BUCKET_NAME: missing.append("bucket_name")
+        if R2_MAX_UPLOAD_MB <= 0: missing.append("max_upload_mb")
+        if R2_MAX_STORAGE_MB <= 0: missing.append("max_storage_mb")
+    return missing
+
+
+def storage_configured() -> bool:
+    return not storage_missing_fields()
+
+
+def _storage_credentials_ok() -> bool:
+    """仅校验访问凭据（不含容量阈值），供列表/HEAD 等只读操作使用。"""
+    if storage_provider_active() == "cos":
+        return bool(COS_SECRET_ID and COS_SECRET_KEY and COS_BUCKET and COS_REGION)
+    return bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME)
+
+
+def storage_max_upload_mb() -> int:
+    return COS_MAX_UPLOAD_MB if storage_provider_active() == "cos" else R2_MAX_UPLOAD_MB
+
+
+def storage_max_storage_mb() -> int:
+    return COS_MAX_STORAGE_MB if storage_provider_active() == "cos" else R2_MAX_STORAGE_MB
+
+
 def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
                        params: dict[str, str] | None = None,
                        data: bytes = b"") -> tuple[str, str]:
-    """Cloudflare R2 AWS Signature V4（零第三方依赖）。"""
+    """AWS Signature V4（零第三方依赖）；兼容 Cloudflare R2 与腾讯云 COS S3 端点。"""
     params = params or {}
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = now.strftime("%Y%m%d")
-    
-    # R2 Endpoint
-    host = f"{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    region = "auto"
+
+    # 按当前提供方取签名所需 region 与密钥
+    _host, region, access_key, secret_key = _storage_sign_params()
     service = "s3"
     
     # Canonical Request
@@ -609,6 +699,11 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
     )
     
     header_map = {k.lower(): str(v).strip() for k, v in headers.items()}
+    # ★ 关键：x-amz-date 必须纳入签名头（SignedHeaders）。
+    # R2 对未签名的 x-amz-date 宽容，但腾讯云 COS 严格按 SignedHeaders 中的
+    # x-amz-date 重建 StringToSign，缺失会报 SignatureDoesNotMatch。
+    # 调用方在签名后设置的 x-amz-date 与此处返回的 amz_date 相同，保持一致。
+    header_map["x-amz-date"] = amz_date
     header_list = sorted(header_map.keys())
     signed_headers = ";".join(header_list)
     
@@ -643,7 +738,7 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
     def _sign(key: bytes, msg: str) -> bytes:
         return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
     
-    k_date = _sign(("AWS4" + R2_SECRET_ACCESS_KEY).encode("utf-8"), date_stamp)
+    k_date = _sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
     k_region = _sign(k_date, region)
     k_service = _sign(k_region, service)
     k_signing = _sign(k_service, "aws4_request")
@@ -652,7 +747,7 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
     
     authorization = (
         f"{algorithm} "
-        f"Credential={R2_ACCESS_KEY_ID}/{credential_scope}, "
+        f"Credential={access_key}/{credential_scope}, "
         f"SignedHeaders={signed_headers}, "
         f"Signature={signature}"
     )
@@ -661,12 +756,14 @@ def _r2_authorization(method: str, object_key: str, headers: dict[str, str],
 
 
 def r2_put_object(data: bytes, object_key: str, content_type: str = "application/octet-stream") -> str:
-    """上传对象到 R2，返回公共 URL。"""
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
+    """上传对象到当前存储桶（R2 或 腾讯云 COS），返回公共 URL。"""
+    if not _storage_credentials_ok():
+        if storage_provider_active() == "cos":
+            raise RuntimeError("COS 未配置，请设置 secret_id, secret_key, bucket, region")
         raise RuntimeError("R2 未配置，请设置环境变量 R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME")
     
     object_key = object_key.lstrip("/")
-    host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    host = _storage_sign_params()[0]
     
     headers = {
         "Host": host,
@@ -687,18 +784,28 @@ def r2_put_object(data: bytes, object_key: str, content_type: str = "application
         with urllib.request.urlopen(req, timeout=60, context=ctx_ssl) as resp:
             if resp.status not in (200, 201):
                 body = resp.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"R2 上传失败 HTTP {resp.status}: {body[:200]}")
+                raise RuntimeError(f"{storage_label()} 上传失败 HTTP {resp.status}: {body[:200]}")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
-        raise RuntimeError(f"R2 上传失败 HTTP {e.code}: {body[:300]}") from e
+        raise RuntimeError(f"{storage_label()} 上传失败 HTTP {e.code}: {body[:300]}") from e
 
     return r2_public_object_url(object_key)
 
 
 def r2_public_object_url(object_key: str, version: str = "") -> str:
-    """生成对象公共 URL；version 用于覆盖同名头像后的浏览器缓存刷新。"""
+    """生成对象公共 URL；version 用于覆盖同名头像后的浏览器缓存刷新。
+
+    - R2:  优先 public_url，其次 https://{bucket}.{account}.r2.dev/
+    - COS: 优先 public_url（CDN/自定义域名），其次桶默认域名
+           https://{bucket}.cos.{region}.myqcloud.com/（需桶开启公有读）。
+    """
     clean_key = str(object_key or "").lstrip("/")
-    if R2_PUBLIC_URL:
+    if storage_provider_active() == "cos":
+        if COS_PUBLIC_URL:
+            url = f"{COS_PUBLIC_URL.rstrip('/')}/{clean_key}"
+        else:
+            url = f"https://{COS_BUCKET}.cos.{COS_REGION}.myqcloud.com/{clean_key}"
+    elif R2_PUBLIC_URL:
         url = f"{R2_PUBLIC_URL.rstrip('/')}/{clean_key}"
     else:
         url = f"https://{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.dev/{clean_key}"
@@ -720,11 +827,11 @@ def avatar_object_key(user_id: str, extension: str = ".png") -> str:
 
 
 def r2_head_object(object_key: str) -> dict[str, Any]:
-    """通过签名 HEAD 判断 R2 对象是否存在，并返回 ETag 作为缓存版本。"""
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
+    """通过签名 HEAD 判断对象（R2/COS）是否存在，并返回 ETag 作为缓存版本。"""
+    if not _storage_credentials_ok():
         return {"exists": False, "etag": ""}
     clean_key = str(object_key or "").lstrip("/")
-    host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    host = _storage_sign_params()[0]
     headers = {
         "Host": host,
         "x-amz-content-sha256": hashlib.sha256(b"").hexdigest(),
@@ -756,10 +863,10 @@ def find_r2_avatar(user_id: str) -> dict[str, Any]:
 
 
 def get_r2_bucket_total_size() -> int:
-    """通过 R2 S3 ListObjectsV2 计算当前桶总大小（字节）。"""
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
+    """通过 S3 ListObjectsV2 计算当前桶（R2/COS）总大小（字节）。"""
+    if not _storage_credentials_ok():
         return 0
-    host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    host = _storage_sign_params()[0]
     total = 0
     continuation = ""
     ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
@@ -784,7 +891,7 @@ def get_r2_bucket_total_size() -> int:
             with urllib.request.urlopen(req, timeout=30, context=ctx_ssl) as resp:
                 xml_data = resp.read()
         except Exception as exc:
-            err(f"[R2] 获取列表失败: {exc}")
+            err(f"[{storage_label()}] 获取列表失败: {exc}")
             return 0
         try:
             import xml.etree.ElementTree as ET
@@ -807,7 +914,7 @@ def get_r2_bucket_total_size() -> int:
             if not is_truncated:
                 break
         except Exception as exc:
-            err(f"[R2] XML 解析失败: {exc}")
+            err(f"[{storage_label()}] XML 解析失败: {exc}")
             break
     return total
 
@@ -846,12 +953,12 @@ def disable_r2_public_access() -> bool:
 
 
 def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
-    """清理 R2 存储桶；默认永久保留 avatars/ 下的用户头像。"""
-    warn("[R2] ⚠️ 执行存储桶清理" + ("（保留用户头像）" if preserve_avatars else "（删除全部对象）"))
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME:
-        err("[R2] 清空存储桶失败：R2 未配置")
+    """清理当前存储桶（R2/COS）；默认永久保留 avatars/ 下的用户头像。"""
+    warn(f"[{storage_label()}] ⚠️ 执行存储桶清理" + ("（保留用户头像）" if preserve_avatars else "（删除全部对象）"))
+    if not _storage_credentials_ok():
+        err(f"[{storage_label()}] 清空存储桶失败：{storage_label()} 未配置")
         return False
-    host = f"{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    host = _storage_sign_params()[0]
     keys: list[str] = []
     continuation = ""
     ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
@@ -876,7 +983,7 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
             with urllib.request.urlopen(req, timeout=30, context=ctx_ssl) as resp:
                 xml_data = resp.read()
         except Exception as exc:
-            err(f"[R2] 清空存储桶 - 列表失败: {exc}")
+            err(f"[{storage_label()}] 清空存储桶 - 列表失败: {exc}")
             return False
         try:
             import xml.etree.ElementTree as ET
@@ -895,7 +1002,7 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
             if not is_truncated:
                 break
         except Exception as exc:
-            err(f"[R2] 清空存储桶 - XML 解析失败: {exc}")
+            err(f"[{storage_label()}] 清空存储桶 - XML 解析失败: {exc}")
             break
     total_deleted = 0
     preserved = 0
@@ -917,32 +1024,31 @@ def empty_r2_bucket(preserve_avatars: bool = True) -> bool:
             with urllib.request.urlopen(del_req, timeout=30, context=ctx_ssl) as resp:
                 total_deleted += 1
         except Exception as exc:
-            err(f"[R2] 清空存储桶 - 删除对象 {key} 失败: {exc}")
-    info(f"[R2] 存储桶清理完成，删除对象数: {total_deleted}，保留头像数: {preserved}")
+            err(f"[{storage_label()}] 清空存储桶 - 删除对象 {key} 失败: {exc}")
+    info(f"[{storage_label()}] 存储桶清理完成，删除对象数: {total_deleted}，保留头像数: {preserved}")
     return True
 
 
 def check_r2_bucket_capacity(source: str = "检查") -> int:
-    """检查 R2 桶容量：记录当前大小与剩余空间；达上限则清理聊天媒体并保留头像。"""
-    if not (
-        R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME
-        and R2_MAX_STORAGE_MB > 0
-    ):
+    """检查当前桶（R2/COS）容量：记录当前大小与剩余空间；达上限则清理聊天媒体并保留头像。"""
+    max_storage_mb = storage_max_storage_mb()
+    if not (_storage_credentials_ok() and max_storage_mb > 0):
         return 0
+    tag = storage_label()
     try:
         sz = get_r2_bucket_total_size()
         used_mb = sz // (1024 * 1024)
-        info(f"[R2 {source}] 当前桶总大小: {used_mb} MB ({sz} bytes)")
-        limit_bytes = R2_MAX_STORAGE_MB * 1024 * 1024
+        info(f"[{tag} {source}] 当前桶总大小: {used_mb} MB ({sz} bytes)")
+        limit_bytes = max_storage_mb * 1024 * 1024
         if sz >= limit_bytes:
-            info(f"[R2 {source}] ⚠️ 已达到 {R2_MAX_STORAGE_MB}MB 上限，清理聊天媒体并保留头像")
+            info(f"[{tag} {source}] ⚠️ 已达到 {max_storage_mb}MB 上限，清理聊天媒体并保留头像")
             empty_r2_bucket(preserve_avatars=True)
         else:
             remaining_mb = max(0, (limit_bytes - sz) // (1024 * 1024))
-            info(f"[R2 {source}] 距离 {R2_MAX_STORAGE_MB}MB 上限还有 {remaining_mb}MB 空间")
+            info(f"[{tag} {source}] 距离 {max_storage_mb}MB 上限还有 {remaining_mb}MB 空间")
         return sz
     except Exception as e:
-        err(f"[R2 {source}] 失败: {e}")
+        err(f"[{tag} {source}] 失败: {e}")
         return 0
 
 
@@ -1033,6 +1139,10 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
         "host": os.getenv("GOEASY_HOST", "").strip(),
         "force_tls": True,
     },
+    "storage": {
+        # 对象存储提供方：'r2' = Cloudflare R2（默认），'cos' = 腾讯云 COS
+        "provider": STORAGE_PROVIDER,
+    },
     "cloudflare_r2": {
         "account_id": R2_ACCOUNT_ID,
         "access_key_id": R2_ACCESS_KEY_ID,
@@ -1042,6 +1152,15 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
         "max_upload_mb": R2_MAX_UPLOAD_MB if R2_MAX_UPLOAD_MB > 0 else "",
         "max_storage_mb": R2_MAX_STORAGE_MB if R2_MAX_STORAGE_MB > 0 else "",
         "cf_api_token": CF_API_TOKEN,
+    },
+    "tencent_cos": {
+        "secret_id": COS_SECRET_ID,
+        "secret_key": COS_SECRET_KEY,
+        "bucket": COS_BUCKET,          # 含 APPID 后缀，例如 mybucket-1250000000
+        "region": COS_REGION,          # 例如 ap-guangzhou
+        "public_url": COS_PUBLIC_URL,  # 可选：CDN/自定义加速域名
+        "max_upload_mb": COS_MAX_UPLOAD_MB if COS_MAX_UPLOAD_MB > 0 else "",
+        "max_storage_mb": COS_MAX_STORAGE_MB if COS_MAX_STORAGE_MB > 0 else "",
     },
     "security": {                           # 新增：存储密码哈希
         "password_hash": "",
@@ -1094,24 +1213,34 @@ def _build_runtime_env_config(cfg: dict[str, Any]) -> dict[str, Any]:
     src = cfg if isinstance(cfg, dict) else {}
     go = src.get("goeasy") if isinstance(src.get("goeasy"), dict) else {}
     r2 = src.get("cloudflare_r2") if isinstance(src.get("cloudflare_r2"), dict) else {}
+    cos = src.get("tencent_cos") if isinstance(src.get("tencent_cos"), dict) else {}
+    storage = src.get("storage") if isinstance(src.get("storage"), dict) else {}
+    provider = str(storage.get("provider", "") or "r2").strip().lower()
+    if provider not in ("r2", "cos"):
+        provider = "r2"
+    # 前端上传限制取「当前生效提供方」的 max_upload_mb
+    active = cos if provider == "cos" else r2
     return {
         "goeasy": {
             "appkey": str(go.get("appkey", "") or "").strip(),
             "host": str(go.get("host", "") or "").strip(),
             "force_tls": bool(go.get("force_tls", True)),
         },
+        "storage": {"provider": provider},
         "cloudflare_r2": {
-            "max_upload_mb": r2.get("max_upload_mb", "") if r2.get("max_upload_mb", "") != "" else "",
-            "max_storage_mb": r2.get("max_storage_mb", "") if r2.get("max_storage_mb", "") != "" else "",
+            "max_upload_mb": active.get("max_upload_mb", "") if active.get("max_upload_mb", "") != "" else "",
+            "max_storage_mb": active.get("max_storage_mb", "") if active.get("max_storage_mb", "") != "" else "",
         },
     }
 
 
 def apply_r2_config_to_runtime(cfg: dict[str, Any]) -> None:
-    """把 cloudflare_r2 配置即时应用到运行时的全局变量（上传接口立即生效）。"""
+    """把 storage/cloudflare_r2/tencent_cos 配置即时应用到运行时全局变量（上传接口立即生效）。"""
     global R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, \
         R2_BUCKET_NAME, R2_PUBLIC_URL, R2_MAX_UPLOAD_MB, R2_MAX_STORAGE_MB, \
-        CF_API_TOKEN
+        CF_API_TOKEN, STORAGE_PROVIDER, \
+        COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET, COS_REGION, \
+        COS_PUBLIC_URL, COS_MAX_UPLOAD_MB, COS_MAX_STORAGE_MB
     r2 = cfg.get("cloudflare_r2") if isinstance(cfg, dict) else {}
     if not isinstance(r2, dict):
         r2 = {}
@@ -1129,6 +1258,31 @@ def apply_r2_config_to_runtime(cfg: dict[str, Any]) -> None:
     except (TypeError, ValueError):
         R2_MAX_STORAGE_MB = 0
     CF_API_TOKEN = str(r2.get("cf_api_token", "") or "").strip()
+
+    # ---- 腾讯云 COS ----
+    cos = cfg.get("tencent_cos") if isinstance(cfg, dict) else {}
+    if not isinstance(cos, dict):
+        cos = {}
+    COS_SECRET_ID = str(cos.get("secret_id", "") or "").strip()
+    COS_SECRET_KEY = str(cos.get("secret_key", "") or "").strip()
+    COS_BUCKET = str(cos.get("bucket", "") or "").strip()
+    COS_REGION = str(cos.get("region", "") or "").strip()
+    COS_PUBLIC_URL = str(cos.get("public_url", "") or "").strip()
+    try:
+        COS_MAX_UPLOAD_MB = max(0, int(cos.get("max_upload_mb", 0) or 0))
+    except (TypeError, ValueError):
+        COS_MAX_UPLOAD_MB = 0
+    try:
+        COS_MAX_STORAGE_MB = max(0, int(cos.get("max_storage_mb", 0) or 0))
+    except (TypeError, ValueError):
+        COS_MAX_STORAGE_MB = 0
+
+    # ---- 提供方选择 ----
+    storage = cfg.get("storage") if isinstance(cfg, dict) else {}
+    if not isinstance(storage, dict):
+        storage = {}
+    provider = str(storage.get("provider", "") or "").strip().lower()
+    STORAGE_PROVIDER = provider if provider in ("r2", "cos") else "r2"
 
 
 # env.json 上次应用的时间戳（mtime_ns），用于检测文件是否被外部移动/恢复/编辑
@@ -1176,16 +1330,15 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
             existing[key] = value
 
     # 确保必要 section 存在
-    for section in ("goeasy", "cloudflare_r2", "security"):
+    for section in ("goeasy", "storage", "cloudflare_r2", "tencent_cos", "security"):
         if section not in existing:
             existing[section] = {}
 
     Path(ENV_CONFIG_FILE).write_text(
         json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    # 应用 R2 配置
-    if "cloudflare_r2" in existing:
-        apply_r2_config_to_runtime(existing)
+    # 应用存储配置（R2 / 腾讯云 COS / 提供方切换）
+    apply_r2_config_to_runtime(existing)
 
     # 记录本次应用后的文件 mtime，避免紧接着的上传重复读取磁盘
     global _env_config_applied_mtime
@@ -3386,18 +3539,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     # ★ 先按磁盘上的 env.json 刷新运行时 R2 配置，
                     #   避免 env.json 被移出再放回后运行时的旧空凭据导致上传失败。
                     reload_r2_config_if_changed()
-                    missing_r2 = []
-                    if not R2_ACCOUNT_ID: missing_r2.append("account_id")
-                    if not R2_ACCESS_KEY_ID: missing_r2.append("access_key_id")
-                    if not R2_SECRET_ACCESS_KEY: missing_r2.append("secret_access_key")
-                    if not R2_BUCKET_NAME: missing_r2.append("bucket_name")
-                    if R2_MAX_UPLOAD_MB <= 0: missing_r2.append("max_upload_mb")
-                    if R2_MAX_STORAGE_MB <= 0: missing_r2.append("max_storage_mb")
+                    missing_r2 = storage_missing_fields()
                     if missing_r2:
-                        raise ValueError("R2 未配置完整，请先设置：" + ", ".join(missing_r2))
+                        raise ValueError(f"{storage_label()} 未配置完整，请先设置：" + ", ".join(missing_r2))
                     if content_length <= 0:
                         raise ValueError("空请求体")
-                    avatar_limit = min(R2_MAX_UPLOAD_MB, 5) * 1024 * 1024
+                    avatar_limit = min(storage_max_upload_mb(), 5) * 1024 * 1024
                     if content_length > avatar_limit + 256 * 1024:
                         raise ValueError(f"头像文件过大，最大允许 {avatar_limit // (1024 * 1024)}MB")
                     if "multipart/form-data" not in content_type.lower():
@@ -3439,14 +3586,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
                     # 达到容量阈值时只清理聊天媒体，avatars/ 始终保留。
                     total_bytes = get_r2_bucket_total_size()
-                    if total_bytes >= R2_MAX_STORAGE_MB * 1024 * 1024:
+                    if total_bytes >= storage_max_storage_mb() * 1024 * 1024:
                         empty_r2_bucket(preserve_avatars=True)
 
                     object_key = avatar_object_key(user_id, ext)
                     r2_put_object(avatar_data, object_key, avatar_type)
                     version = hashlib.sha256(avatar_data).hexdigest()[:24]
                     avatar_url = r2_public_object_url(object_key, version)
-                    info(f"[R2头像] 上传成功 user={user_id} size={len(avatar_data)} key={object_key}")
+                    info(f"[{storage_label()}头像] 上传成功 user={user_id} size={len(avatar_data)} key={object_key}")
                     check_r2_bucket_capacity("上传后检查")
                     data = {
                         "ok": True,
@@ -3457,7 +3604,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     }
                     body, headers, status = make_json_response(data)
                 except Exception as e:
-                    err(f"[R2头像] 上传失败: {e}")
+                    err(f"[{storage_label()}头像] 上传失败: {e}")
                     body, headers, status = make_json_response({"ok": False, "error": str(e)}, status=400)
                 self._send(body, headers, status)
                 return
@@ -3467,35 +3614,31 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 try:
                     # ★ 先按磁盘上的 env.json 刷新运行时 R2 配置（同上，兼容外部恢复文件）。
                     reload_r2_config_if_changed()
-                    missing_r2 = []
-                    if not R2_ACCOUNT_ID: missing_r2.append("account_id")
-                    if not R2_ACCESS_KEY_ID: missing_r2.append("access_key_id")
-                    if not R2_SECRET_ACCESS_KEY: missing_r2.append("secret_access_key")
-                    if not R2_BUCKET_NAME: missing_r2.append("bucket_name")
-                    if R2_MAX_UPLOAD_MB <= 0: missing_r2.append("max_upload_mb")
-                    if R2_MAX_STORAGE_MB <= 0: missing_r2.append("max_storage_mb")
+                    missing_r2 = storage_missing_fields()
                     if missing_r2:
-                        raise ValueError("R2 未配置完整，请先设置：" + ", ".join(missing_r2))
+                        raise ValueError(f"{storage_label()} 未配置完整，请先设置：" + ", ".join(missing_r2))
+                    max_upload_mb = storage_max_upload_mb()
+                    max_storage_mb = storage_max_storage_mb()
                     if content_length <= 0:
                         raise ValueError("空请求体")
-                    if content_length > R2_MAX_UPLOAD_MB * 1024 * 1024 + 1024 * 1024:
-                        raise ValueError(f"文件过大，最大允许 {R2_MAX_UPLOAD_MB}MB")
+                    if content_length > max_upload_mb * 1024 * 1024 + 1024 * 1024:
+                        raise ValueError(f"文件过大，最大允许 {max_upload_mb}MB")
                     # 按用户配置的容量限制检查；不再内置固定桶容量值。
                     try:
                         total_bytes = get_r2_bucket_total_size()
-                        limit_bytes = R2_MAX_STORAGE_MB * 1024 * 1024
+                        limit_bytes = max_storage_mb * 1024 * 1024
                         if total_bytes >= limit_bytes:
                             try:
-                                info(f"[R2] 已达 {R2_MAX_STORAGE_MB}MB 上限，清理聊天媒体并保留头像...")
+                                info(f"[{storage_label()}] 已达 {max_storage_mb}MB 上限，清理聊天媒体并保留头像...")
                                 empty_r2_bucket(preserve_avatars=True)
-                                info("[R2] 聊天媒体已清理，用户头像已保留，继续本次上传")
+                                info(f"[{storage_label()}] 聊天媒体已清理，用户头像已保留，继续本次上传")
                             except Exception as exc:
-                                err(f"[R2] 清空存储桶异常: {exc}")
+                                err(f"[{storage_label()}] 清空存储桶异常: {exc}")
                             # 清空后继续本次上传，不再拒绝
                     except ValueError:
                         raise
                     except Exception as exc:
-                        err(f"[R2] 容量检查异常: {exc}")
+                        err(f"[{storage_label()}] 容量检查异常: {exc}")
                         raise ValueError("存储状态异常，已关闭上传")
                     raw_body = self.rfile.read(content_length)
                     if "multipart/form-data" not in content_type.lower():
@@ -3509,8 +3652,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                 break
                     if not file_part or not file_part.get("data"):
                         raise ValueError("未找到上传文件字段（name=file）")
-                    if len(file_part["data"]) > R2_MAX_UPLOAD_MB * 1024 * 1024:
-                        raise ValueError(f"文件过大，最大允许 {R2_MAX_UPLOAD_MB}MB")
+                    if len(file_part["data"]) > max_upload_mb * 1024 * 1024:
+                        raise ValueError(f"文件过大，最大允许 {max_upload_mb}MB")
                     data = bytes(file_part["data"])
                     # 原始文件名（含中文），返回给前端显示
                     original_filename = file_part.get("filename") or "file"
@@ -3536,7 +3679,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     ext = ext_match.group(1) if ext_match else ""
                     object_key = f"chat/{file_type}/{day}/{uuid.uuid4().hex}{ext}"
                     url = r2_put_object(data, object_key, ctype)
-                    info(f"[R2] 上传成功 type={file_type} size={len(data)} key={object_key}")
+                    info(f"[{storage_label()}] 上传成功 type={file_type} size={len(data)} key={object_key}")
                     check_r2_bucket_capacity("上传后检查")
                     resp = {
                         "ok": True,
@@ -3549,7 +3692,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     }
                     body, headers, status = make_json_response(resp)
                 except Exception as e:
-                    err(f"[R2] 上传失败: {e}")
+                    err(f"[{storage_label()}] 上传失败: {e}")
                     body, headers, status = make_json_response(
                         {"ok": False, "error": str(e)}, status=400
                     )
@@ -3996,15 +4139,12 @@ def main() -> None:
     info(f"[配置] 远程标题映射本地路径: {LOCAL_CHINESE_DB_FILE}")
     info(f"[配置] 全局 TTL: {CACHE_TTL} 秒")
 
-    # 仅配置完整时检查 R2；无内置值的全新安装直接跳过。
-    r2_ready = bool(
-        R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME
-        and R2_MAX_UPLOAD_MB > 0 and R2_MAX_STORAGE_MB > 0
-    )
-    if r2_ready:
+    # 仅配置完整时检查存储桶（R2/COS）；无内置值的全新安装直接跳过。
+    info(f"[存储] 当前对象存储提供方: {storage_label()}")
+    if storage_configured():
         check_r2_bucket_capacity("启动检查")
     else:
-        info("[R2 启动检查] 未配置，已跳过")
+        info(f"[{storage_label()} 启动检查] 未配置，已跳过")
 
     start_remote_download_thread()
 
