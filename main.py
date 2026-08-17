@@ -2094,28 +2094,45 @@ QUESTION_ICON = "data:image/svg+xml," + urllib.parse.quote(_QUESTION_SVG)
 UNKNOWN_ID = "FFFFFFFFFFFFFFFF"
 
 
-def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, str]:
-    normalized = str(content_id or "").upper()
-    game_name = titles_map.get(normalized)
-    is_unknown = False
-    if not game_name:
-        game_name = f"未知游戏 ({normalized})" if normalized else "未知游戏"
-        is_unknown = True
-    if game_name and game_name.startswith("未知游戏") and normalized != UNKNOWN_ID:
-        is_unknown = True
-    if normalized == UNKNOWN_ID:
-        is_unknown = False
-        game_name = "未知游戏"
+def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, Any]:
+    """标题映射解析。
 
-    if is_unknown:
+    规则（无映射时不再显示「未知游戏」占位名）：
+    - 命中映射            → 显示映射到的中文/英文标题
+    - 未命中映射          → 直接显示标题 ID（如 0100ABCDEF012000）
+    - 空 ID / FFFF 哨兵值 → 仍显示「未知游戏」+ 问号图标（协议本身就没给标题）
+
+    图标：未映射的 ID 也先按 ID 去图库拉真实图标，前端 onerror 时再回退问号图标。
+    """
+    normalized = str(content_id or "").upper()
+    mapped = titles_map.get(normalized)
+
+    # 只有真正无 ID 可显示的情况才叫「未知游戏」
+    is_placeholder = (not normalized) or normalized == UNKNOWN_ID
+    is_unmapped = False
+
+    if is_placeholder:
+        game_name = "未知游戏"
+    elif mapped:
+        game_name = mapped
+        # 兼容历史映射表里写死的 "未知游戏 (xxx)" 之类占位名 → 退回纯 ID
+        if game_name.startswith("未知游戏") or game_name.strip() == "":
+            game_name = normalized
+            is_unmapped = True
+    else:
+        game_name = normalized
+        is_unmapped = True
+
+    if is_placeholder:
         icon = QUESTION_ICON
     else:
-        icon = f"https://api.nlib.cc/nx/{normalized or 'FFFFFFFFFFFFFFFF'}/icon/128/128"
-        # 备用图库 icon = f"https://tinfoil.media/ti/{normalized or 'FFFFFFFFFFFFFFFF'}/128/128"
+        icon = f"https://api.nlib.cc/nx/{normalized}/icon/128/128"
+        # 备用图库 icon = f"https://tinfoil.media/ti/{normalized}/128/128"
 
     return {
         "name": game_name,
-        "icon": icon
+        "icon": icon,
+        "unmapped": is_unmapped,
     }
 
 # ============================================================================
@@ -2783,6 +2800,7 @@ def normalize_room(raw: Any, server: dict[str, Any], index: int,
         "content_id": content_id,
         "game": g_info["name"],
         "game_icon": g_info["icon"],
+        "game_unmapped": bool(g_info.get("unmapped")),
         "host": host,
         "node_count": node_count or len(players),
         "node_count_max": node_max,
@@ -2997,7 +3015,7 @@ def get_static_file(filename: str) -> str:
     return ""
 
 
-PWA_CACHE_VERSION = "20260808_4"
+PWA_CACHE_VERSION = "20260817_1"
 _PWA_ICON_CACHE: dict[int, bytes] = {}
 
 
@@ -3115,7 +3133,7 @@ const CACHE_NAME = 'lanplay-pwa-{PWA_CACHE_VERSION}';
 const APP_SHELL = [
   '/',
   '/manifest.webmanifest',
-  '/static/script.js?v=20260808_9',
+  '/static/script.js?v=20260817_1',
   '/static/pwa-icon-192.png?v=20260808_4',
   '/static/pwa-icon-512.png?v=20260808_4'
 ];
@@ -3184,7 +3202,7 @@ def build_html() -> str:
   <title>LAN-Play 房间监控</title>
 </head>
 <body>
-<script src="/static/script.js?v=20260808_9"></script>
+<script src="/static/script.js?v=20260817_1"></script>
 </body>
 </html>"""
 

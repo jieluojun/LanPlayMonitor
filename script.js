@@ -1347,6 +1347,10 @@ html.dark .server-error-badge {
   cursor: pointer;
   border: 1px dashed var(--red);
   transition: var(--transition);
+  /* 未收录标题：直接显示 16 位标题 ID，用等宽字体便于辨认/核对 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  letter-spacing: .2px;
 }
 .game-name.copy-game-id:hover {
   background: rgba(220,48,72,.15);
@@ -4312,6 +4316,29 @@ html:not(.dark) {
       );
     const UNKNOWN_ID = "FFFFFFFFFFFFFFFF";
 
+    // 标题 ID 形态：16 位十六进制
+    const TITLE_ID_RE = /^[0-9A-F]{16}$/;
+
+    /**
+     * 房间显示用的游戏名。
+     * - 有映射            → 映射名
+     * - 无映射但有标题 ID → 直接显示标题 ID（不再显示「未知游戏」）
+     * - 连 ID 都没有      → 「未知游戏」
+     * 同时兼容旧后端返回的 "未知游戏 (0100XXXX...)" 形式。
+     */
+    function resolveRoomGameLabel(room) {
+      const raw = (room && room.game == null ? "" : String(room.game)).trim();
+      const cid = String((room && room.content_id) || "").toUpperCase();
+      const hasId = !!cid && cid !== UNKNOWN_ID;
+
+      // 旧后端占位名：未知游戏 / 未知游戏 (TITLEID) / 其它「未知」开头占位
+      if (!raw || /^未知/.test(raw)) {
+        return hasId ? cid : "未知游戏";
+      }
+      return raw;
+    }
+
+
     // ---------- 滚动位置存储（聊天用） ----------
     const CHAT_SCROLL_PREFIX = "lanplay_chat_scroll_";
     const PUBLIC_SCROLL_KEY = "lanplay_public_scroll";
@@ -5873,23 +5900,29 @@ html:not(.dark) {
     function roomCard(room, display) {
       const players = Array.isArray(room.players) ? room.players : [];
       const count = `${room.node_count || players.length}${room.node_count_max ? " / " + room.node_count_max : ""} 人`;
-      const gameVal = String(room.game || "");
       const contentId = String(room.content_id || "").toUpperCase();
-      const isUnknownId = contentId === UNKNOWN_ID;
-      const isUnknown = gameVal.includes("未知游戏") && !isUnknownId;
-      const iconUrl = room.game_icon || QUESTION_ICON_DATA;
+      // 无标题 ID / FFFF 哨兵值 → 真·未知游戏；其余一律有 ID 可显示
+      const isPlaceholder = !contentId || contentId === UNKNOWN_ID;
+      // 未映射：后端标记，或名字本身就等于标题 ID（兼容旧后端）
+      const gameVal = resolveRoomGameLabel(room);
+      const isUnmapped =
+        !isPlaceholder &&
+        (room.game_unmapped === true || gameVal === contentId);
+
+      const iconUrl = room.game_icon || "";
       const finalIcon =
-        isUnknown || !iconUrl || iconUrl === "" ? QUESTION_ICON_DATA : iconUrl;
+        isPlaceholder || !iconUrl ? QUESTION_ICON_DATA : iconUrl;
 
       let iconHtml;
-      if (contentId === UNKNOWN_ID) {
-        iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;cursor:default;" title="${esc(room.game)}">?</span>`;
+      if (isPlaceholder) {
+        iconHtml = `<span class="room-icon" style="display:inline-block;width:22px;height:22px;border-radius:4px;background:#34495e;color:white;text-align:center;line-height:22px;font-weight:bold;font-size:14px;cursor:default;" title="${esc(gameVal)}">?</span>`;
       } else {
-        iconHtml = `<img src="${finalIcon}" alt="${esc(room.game)}" title="点击放大查看 - ${esc(room.game)}" class="room-icon" loading="lazy" data-full="${esc(finalIcon)}" draggable="false" style="cursor:zoom-in;" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
+        // 未映射的 ID 也先尝试拉真实图标，失败再回退问号
+        iconHtml = `<img src="${finalIcon}" alt="${esc(gameVal)}" title="点击放大查看 - ${esc(gameVal)}" class="room-icon" loading="lazy" data-full="${esc(finalIcon)}" draggable="false" style="cursor:zoom-in;" onerror="this.onerror=null;this.src='${QUESTION_ICON_DATA}'">`;
       }
 
       const gameDisplay = gameVal;
-      const canCopy = isUnknown && !isUnknownId;
+      const canCopy = isUnmapped;
       const copyClass = canCopy ? "copy-game-id" : "no-copy";
       const gameTitle = canCopy ? `点击复制游戏 ID: ${contentId}` : gameVal;
 
@@ -5899,7 +5932,7 @@ html:not(.dark) {
       let hostHtml = `<span class="room-host-meta"><span class="host-icon-fixed">🏠</span><span class="host-name ellipsis">${esc(hostName)}</span></span>`;
 
       const roomId = esc(room.id || "");
-      const gameKey = normalizeFilterGame(gameVal);
+      const gameKey = gameVal; // 已是最终标签（游戏名 / 标题 ID / 未知游戏）
       // ★★★ 修复：通过 display 参数控制初始显示状态，避免闪现 ★★★
       const displayStyle = display === "none" ? "display:none;" : "";
       return `<div class="room-item" data-game="${esc(gameVal)}" data-game-key="${esc(gameKey)}" data-room-id="${roomId}" style="${displayStyle}">
@@ -6289,12 +6322,9 @@ html:not(.dark) {
         .reduce((a, s) => a + (s.idle || 0), 0);
       document.getElementById("ovRooms").textContent = filteredRooms.length;
       document.querySelectorAll(".room-item").forEach((el) => {
-        const roomGame =
-          el.dataset.gameKey || normalizeFilterGame(el.dataset.game);
+        const roomGame = el.dataset.gameKey || el.dataset.game || "";
         el.style.display =
-          isAll || isAllServers || roomGame === normalizeFilterGame(g)
-            ? ""
-            : "none";
+          isAll || isAllServers || roomGame === g ? "" : "none";
       });
       state.servers.forEach((s) => {
         const group = document.querySelector(
@@ -13562,13 +13592,21 @@ html:not(.dark) {
     const ROOM_KEEP_MISSES = 5;
     const _roomKeepClient = Object.create(null); // key -> { room, misses }
 
-    function normalizeFilterGame(game) {
+    function normalizeFilterGame(game, room) {
+      // 传 room 时走完整解析；只传字符串时做兼容处理
+      if (room !== undefined) return resolveRoomGameLabel(room);
       const g = (game == null ? "" : String(game)).trim();
       if (!g) return "未知游戏";
-      // 统一：未知游戏 / 未知游戏 (TITLEID) / 含「未知」的占位名
-      if (g === "未知游戏" || g.startsWith("未知游戏") || /^未知/.test(g))
-        return "未知游戏";
+      // 兼容旧数据里的 "未知游戏 (TITLEID)" → 取出 ID
+      const m = g.match(/^未知游戏\s*\(([0-9A-Fa-f]{16})\)$/);
+      if (m) return m[1].toUpperCase();
+      if (/^未知/.test(g)) return "未知游戏";
       return g;
+    }
+
+    // 「未映射」= 标签本身就是一个纯标题 ID
+    function isUnmappedFilterGame(gameKey) {
+      return TITLE_ID_RE.test(String(gameKey || "").toUpperCase());
     }
 
     function isUnknownFilterGame(game) {
@@ -13581,7 +13619,7 @@ html:not(.dark) {
         r.id || "",
         r.content_id || "",
         r.host || "",
-        normalizeFilterGame(r.game),
+        resolveRoomGameLabel(r),
       ].join("|");
     }
 
@@ -13604,16 +13642,21 @@ html:not(.dark) {
       return Object.keys(_roomKeepClient).map((k) => _roomKeepClient[k].room);
     }
 
-    // 从保活后的房间列表提取游戏（含未知游戏）
+    // 从保活后的房间列表提取游戏标签
+    // 有映射 → 游戏名；无映射 → 各自的标题 ID（每个 ID 一个独立标签）
     function getActiveFilterGames() {
       const set = new Set();
       (state.rooms || []).forEach((r) => {
-        set.add(normalizeFilterGame(r.game));
+        set.add(resolveRoomGameLabel(r));
       });
       const list = [...set];
+      // 排序：未知游戏最前 → 已映射游戏名（拼音序）→ 纯标题 ID 垫底
       list.sort((a, b) => {
         if (a === "未知游戏") return -1;
         if (b === "未知游戏") return 1;
+        const ai = isUnmappedFilterGame(a) ? 1 : 0;
+        const bi = isUnmappedFilterGame(b) ? 1 : 0;
+        if (ai !== bi) return ai - bi;
         return String(a).localeCompare(String(b), "zh");
       });
       return list;
@@ -13621,8 +13664,7 @@ html:not(.dark) {
 
     function roomMatchesFilterGame(room, gameKey) {
       if (gameKey === "all" || gameKey === "all_servers") return true;
-      if (gameKey === "未知游戏") return isUnknownFilterGame(room.game);
-      return normalizeFilterGame(room.game) === gameKey;
+      return resolveRoomGameLabel(room) === gameKey;
     }
 
     /**
@@ -13669,7 +13711,7 @@ html:not(.dark) {
       if (
         state.game !== "all" &&
         state.game !== "all_servers" &&
-        !activeGames.has(normalizeFilterGame(state.game))
+        !activeGames.has(state.game)
       ) {
         state.game = "all";
       }
@@ -13687,14 +13729,17 @@ html:not(.dark) {
           count = state.servers.length;
           label = `全部 (${count})`;
         } else {
-          // 游戏标签：显示该游戏的保活房间数（包括未知游戏）
+          // 游戏标签：显示该游戏的保活房间数
+          // 未映射的标题直接以标题 ID 作为标签，每个 ID 一个独立标签
           count = state.rooms.filter(
-            (r) => normalizeFilterGame(r.game) === g,
+            (r) => resolveRoomGameLabel(r) === g,
           ).length;
-          label = `${esc(g)} (${count})`;
+          label = `${g} (${count})`;
         }
         btn.dataset.game = g;
+        // textContent 自带转义，无需 esc()
         btn.textContent = label;
+        btn.title = isUnmappedFilterGame(g) ? `未收录标题 ID: ${g}` : label;
 
         const active =
           (g === "all" && state.game === "all") ||
