@@ -2711,6 +2711,18 @@ html.light #publicChatMessages {
   -webkit-user-select: none !important;
   user-select: none !important;
 }
+/* 播放器控件是按钮不是正文：长按播放键/音量键不触发系统文字选择与“复制”菜单。
+   选择器优先级 (0,3,0) 高于上面 .chat-msg .msg-body * 的 (0,2,0)，同为 !important 时后者被覆盖。 */
+.chat-msg .msg-body .chat-video-wrap,
+.chat-msg .msg-body .chat-video-wrap *,
+.chat-msg .msg-body .audio-player-ui,
+.chat-msg .msg-body .audio-player-ui * {
+  -webkit-user-select: none !important;
+  -moz-user-select: none !important;
+  -ms-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+}
 .chat-msg img,
 .chat-msg video,
 .chat-msg audio {
@@ -4194,6 +4206,15 @@ html:not(.dark) {
     }
 
     document.addEventListener("contextmenu", (e) => {
+      // 播放器控件（视频/语音按钮、进度条）不是正文：长按不呼出系统复制/选择菜单
+      if (
+        e.target &&
+        e.target.closest &&
+        e.target.closest(".chat-video-wrap, .audio-player-ui")
+      ) {
+        e.preventDefault();
+        return;
+      }
       // 允许输入框、文本区域与聊天气泡长按呼出复制/粘贴/选择菜单
       if (
         e.target &&
@@ -4206,6 +4227,15 @@ html:not(.dark) {
       e.preventDefault();
     });
     document.addEventListener("selectstart", (e) => {
+      // 播放器控件上不启动文字选择，防止长按播放键弹出“复制”
+      if (
+        e.target &&
+        e.target.closest &&
+        e.target.closest(".chat-video-wrap, .audio-player-ui")
+      ) {
+        e.preventDefault();
+        return;
+      }
       // 允许输入框、文本区域与聊天气泡内文字自由选择与复制
       if (
         e.target &&
@@ -9941,12 +9971,30 @@ html:not(.dark) {
       }
     }
 
+    // 视频消息：整条气泡都可长按呼出撤回/删除（与文字/图片消息一致），
+    // 只排除真正需要自身交互的控件：
+    //  ① 底部控制条 .chat-video-controls（进度条/播放/静音/全屏按钮）；
+    //  ② “下载视频”链接（抬手会触发下载）。
+    // 视频画面、中央播放键、发送人名、时间行等区域均允许长按。
+    function _interactiveAreaAt(row, el) {
+      if (!el || !el.closest) return null;
+      const controls = el.closest(".chat-video-controls");
+      if (controls) return controls;
+      if (
+        row.querySelector(".chat-media-video") &&
+        el.closest(".chat-media-download")
+      )
+        return el.closest(".chat-media-download");
+      return null;
+    }
     function _allowMsgLongPressAt(row, x, y, target) {
       if (!row) return false;
-      const video = row.querySelector(".chat-media-video");
-      // 普通文字/文件消息保持原来的整条气泡长按；视频消息只允许按视频本体。
-      if (!video) return true;
-      return _videoAtPoint(x, y, target) === video;
+      // 同时用 elementFromPoint 的实际命中元素和事件原始 target 判断，
+      // 避免 WebView 在视频表面命中异常时误放行/误拦截。
+      const pointEl = document.elementFromPoint(x, y);
+      if (_interactiveAreaAt(row, pointEl) || _interactiveAreaAt(row, target))
+        return false;
+      return true;
     }
 
     function _markMessageClickSuppressed(row) {
@@ -10270,24 +10318,6 @@ html:not(.dark) {
       }
     });
 
-    // 只认视频播放器本体的可见矩形；自定义控制栏也属于当前视频区域。
-    function _videoAtPoint(x, y, fallbackTarget) {
-      function findVideo(el) {
-        if (!el || !el.closest) return null;
-        const direct = el.closest(".chat-media-video");
-        if (direct) return direct;
-        const player = el.closest(".chat-video-player");
-        return player ? player.querySelector(".chat-media-video") : null;
-      }
-      const pointTarget = document.elementFromPoint(x, y);
-      const video = findVideo(pointTarget) || findVideo(fallbackTarget);
-      if (!video) return null;
-      const rect = video.getBoundingClientRect();
-      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom)
-        return null;
-      return video;
-    }
-
     function _videoPlayerFor(video) {
       return video && video.closest
         ? video.closest(".chat-video-player")
@@ -10374,6 +10404,11 @@ html:not(.dark) {
         if (!video) return;
         e.preventDefault();
         e.stopPropagation();
+        // 长按呼出菜单后的抬手点击不再触发播放/暂停/全屏等动作
+        if (_consumeSuppressedMessageClick(control)) {
+          e.stopImmediatePropagation();
+          return;
+        }
         if (control.classList.contains("chat-video-fullscreen-toggle")) {
           // 只打开网页内播放器，不调用 Android 原生全屏接口。
           if (!player.closest("#chatVideoLightbox")) {
