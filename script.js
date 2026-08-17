@@ -5476,6 +5476,9 @@ html:not(.dark) {
     let logPollToken = 0;
     let logAbortController = null;
     let logVersion = -1;
+    let logPointerSelecting = false;
+    let logPendingData = null;
+    let logSelectionFlushTimer = null;
     const LOG_AUTOSCROLL_KEY = "lanplay_log_autoscroll";
     let logAutoScroll = localStorage.getItem(LOG_AUTOSCROLL_KEY) !== "0";
 
@@ -5490,11 +5493,87 @@ html:not(.dark) {
       });
     }
 
+    function hasActiveLogSelection() {
+      if (!logContent || typeof window.getSelection !== "function") return false;
+      try {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed || selection.rangeCount < 1)
+          return false;
+        const anchorInside =
+          !!selection.anchorNode && logContent.contains(selection.anchorNode);
+        const focusInside =
+          !!selection.focusNode && logContent.contains(selection.focusNode);
+        if (anchorInside || focusInside) return true;
+        // 兼容从日志区域内拖到区域外的跨节点选择。
+        const range = selection.getRangeAt(0);
+        return typeof range.intersectsNode === "function"
+          ? range.intersectsNode(logContent)
+          : false;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function applyLogText(d) {
+      if (!d || !Array.isArray(d.logs) || !logContent) return;
+      const nextText = d.logs.join("\n");
+      // 内容没有变化时不要重设 textContent，否则也会清除浏览器选区。
+      if (logContent.textContent !== nextText) logContent.textContent = nextText;
+      if (logAutoScroll) logContent.scrollTop = logContent.scrollHeight;
+    }
+
+    function flushPendingLogsWhenSafe() {
+      if (
+        !logPendingData ||
+        logPointerSelecting ||
+        hasActiveLogSelection() ||
+        !logModal.classList.contains("open")
+      )
+        return;
+      const pending = logPendingData;
+      logPendingData = null;
+      applyLogText(pending);
+    }
+
+    function schedulePendingLogFlush() {
+      if (logSelectionFlushTimer) clearTimeout(logSelectionFlushTimer);
+      logSelectionFlushTimer = setTimeout(() => {
+        logSelectionFlushTimer = null;
+        flushPendingLogsWhenSafe();
+      }, 120);
+    }
+
     function renderLogs(d) {
       if (!d || !Array.isArray(d.logs) || !logContent) return;
-      logContent.textContent = d.logs.join("\n");
+      // 即使暂缓 DOM 更新也要推进长轮询版本，避免服务端对同一版本立即重复响应。
       if (Number.isFinite(Number(d.version))) logVersion = Number(d.version);
-      if (logAutoScroll) logContent.scrollTop = logContent.scrollHeight;
+      if (logPointerSelecting || hasActiveLogSelection()) {
+        // 只保留最新快照；用户取消选区后一次性刷新，避免积压多次重绘。
+        logPendingData = d;
+        return;
+      }
+      logPendingData = null;
+      applyLogText(d);
+    }
+
+    // 用户长按、拖动选择或复制日志时暂停 DOM 重绘，防止轮询清空选区。
+    if (logContent) {
+      logContent.addEventListener("pointerdown", () => {
+        logPointerSelecting = true;
+      });
+      logContent.addEventListener("pointerup", () => {
+        logPointerSelecting = false;
+        schedulePendingLogFlush();
+      });
+      logContent.addEventListener("pointercancel", () => {
+        logPointerSelecting = false;
+        schedulePendingLogFlush();
+      });
+      logContent.addEventListener("touchend", schedulePendingLogFlush, {
+        passive: true,
+      });
+      logContent.addEventListener("copy", schedulePendingLogFlush);
+      document.addEventListener("selectionchange", schedulePendingLogFlush);
     }
 
     async function fetchLogs(waitForChange, token) {
@@ -5525,7 +5604,10 @@ html:not(.dark) {
         if (e && e.name === "AbortError") return;
         if (token !== logPollToken || !logModal.classList.contains("open"))
           return;
-        logContent.textContent = "加载日志失败: " + e.message;
+        renderLogs({
+          logs: ["加载日志失败: " + e.message],
+          version: logVersion,
+        });
         // 网络短暂异常时低频重试，不影响正常的日志变化同步。
         setTimeout(() => fetchLogs(true, token), 1500);
       }
@@ -5536,11 +5618,19 @@ html:not(.dark) {
       if (logAutoScrollCheckbox) logAutoScrollCheckbox.checked = logAutoScroll;
       logPollToken += 1;
       logVersion = -1;
+      logPointerSelecting = false;
+      logPendingData = null;
       fetchLogs(false, logPollToken);
     });
     document.getElementById("closeLogBtn").addEventListener("click", () => {
       logModal.classList.remove("open");
       logPollToken += 1;
+      logPointerSelecting = false;
+      logPendingData = null;
+      if (logSelectionFlushTimer) {
+        clearTimeout(logSelectionFlushTimer);
+        logSelectionFlushTimer = null;
+      }
       if (logAbortController) {
         logAbortController.abort();
         logAbortController = null;
@@ -14784,6 +14874,7 @@ html:not(.dark) {
       if (netCheckTimer) clearInterval(netCheckTimer);
       logPollToken += 1;
       if (logAbortController) logAbortController.abort();
+      if (logSelectionFlushTimer) clearTimeout(logSelectionFlushTimer);
       if (refreshTimer) clearTimeout(refreshTimer);
       if (goEasyInitTimer) clearTimeout(goEasyInitTimer);
       if (presenceRefreshTimer) clearInterval(presenceRefreshTimer);

@@ -66,6 +66,7 @@ _autoclass_error = None       # pyjnius 加载失败的错误信息
 _PythonActivity_cls = None
 _PythonActivity_failed = False  # 类加载失败后不再重试
 _PythonActivity_error = None    # 失败原因（仅记录一次）
+_mactivity_cached = None          # 在 install() 所在线程预取，供后续 Python 子线程复用
 _mactivity_error_logged = False  # mActivity 读取失败只打印一次
 
 
@@ -108,13 +109,24 @@ def _get_python_activity_cls():
 
 
 def _get_mactivity():
-    """直接拿到 PythonActivity.mActivity 实例，失败返回 None（只报错一次）"""
-    global _mactivity_error_logged
+    """取得 PythonActivity.mActivity，并缓存供后续 Python 子线程使用。
+
+    pyjnius 首次 autoclass() 会使用当前线程的 Java ClassLoader。应用启动后创建的
+    Python 子线程可能拿不到 APK 的 ClassLoader，从而误报 ClassNotFoundException；
+    因此 install() 会在启动线程中预取本对象，后续线程不再重新加载 Activity 类。
+    """
+    global _mactivity_cached, _mactivity_error_logged
+    if _mactivity_cached is not None:
+        return _mactivity_cached
     cls = _get_python_activity_cls()
     if cls is None:
         return None
     try:
-        return cls.mActivity
+        activity = cls.mActivity
+        if activity is None:
+            raise RuntimeError("PythonActivity.mActivity 尚未就绪")
+        _mactivity_cached = activity
+        return _mactivity_cached
     except Exception as exc:
         if not _mactivity_error_logged:
             _mactivity_error_logged = True
@@ -153,6 +165,15 @@ def install() -> bool:
         _log_filechooser("请检查 buildozer.spec 的 requirements 是否包含 pyjnius")
         return False
     _log_filechooser("pyjnius 导入成功")
+
+    # 必须在 install() 所在的启动线程预加载 PythonActivity 和 mActivity。
+    # main.py 随后会在 battery-opt-request Python 子线程调用电池接口；若到那时才
+    # 首次 autoclass PythonActivity，子线程的 ClassLoader 可能看不到 APK 类。
+    activity = _get_mactivity()
+    if activity is not None:
+        _log("原生桥接", "✅ PythonActivity/mActivity 已在启动线程预加载")
+    else:
+        _log("原生桥接", "⚠️ PythonActivity/mActivity 预加载失败，依赖 Activity 的接口将不可用")
 
     # ----- 3.2 探测三个 Java 类（只加载，不调用 install） -----
     classes_to_probe = [

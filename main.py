@@ -39,6 +39,39 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # SECTION 1 · 日志捕获器
 # ============================================================================
 
+_LOG_LEVEL_RE = re.compile(r"^\[(INFO|WARN|ERROR)\](?:\s+|$)")
+
+
+def _with_log_level(message: Any) -> str:
+    """确保每条日志都有且只有一个统一的日志等级前缀。"""
+    text = str(message or "").strip()
+    if not text or _LOG_LEVEL_RE.match(text):
+        return text
+
+    lowered = text.lower()
+    if (
+        "❌" in text
+        or "traceback" in lowered
+        or "exception" in lowered
+        or "失败" in text
+        or "异常" in text
+    ):
+        level = "ERROR"
+    elif "⚠" in text or "警告" in text or "不可用" in text:
+        level = "WARN"
+    else:
+        level = "INFO"
+    return f"[{level}] {text}"
+
+
+def _format_log_time(timestamp: float, include_date: bool = False) -> str:
+    """统一日志时间为中文 12 小时制，例如“下午 06:38:47”。"""
+    dt = datetime.fromtimestamp(timestamp)
+    period = "上午" if dt.hour < 12 else "下午"
+    clock = dt.strftime("%I:%M:%S")
+    return f"{dt.strftime('%m-%d')} {period} {clock}" if include_date else f"{period} {clock}"
+
+
 class LogCapturer:
     """日志捕获器：同一种类的重复日志采用“替换”方式。
 
@@ -98,8 +131,11 @@ class LogCapturer:
             return
         if msg_stripped.startswith("Traceback") or "File \"/" in msg_stripped:
             return
+
+        # 所有来源（main、android_native、第三方模块）统一补日志等级。
+        msg_stripped = _with_log_level(msg_stripped)
         if self.terminal:
-            self.terminal.write(message)
+            self.terminal.write(msg_stripped + ("\n" if message.endswith("\n") else ""))
             self.terminal.flush()
         # 超长日志截断，避免单条几 MB 的内容常驻内存
         if len(msg_stripped) > self.MAX_LINE:
@@ -140,8 +176,8 @@ class LogCapturer:
     def _format(entry: list[Any]) -> str:
         text, _first, last = entry
         last_dt = datetime.fromtimestamp(last)
-        fmt = "%H:%M:%S" if last_dt.date() == datetime.now().date() else "%m-%d %H:%M:%S"
-        ts = last_dt.strftime(fmt)
+        # 使用固定中文 12 小时制，不依赖设备 locale 的 AM/PM 文案。
+        ts = _format_log_time(last, include_date=last_dt.date() != datetime.now().date())
         return f"{text} | 更新于 {ts}"
 
     def get_logs(self) -> list[str]:
@@ -193,7 +229,7 @@ try:
     import android_native
     android_native_ok = android_native.install()
 except Exception as _native_exc:
-    print("[原生桥接] 初始化失败:", repr(_native_exc))
+    print(f"[原生桥接] 初始化失败: {_native_exc!r}")
     android_native_ok = False
 
 
@@ -213,9 +249,29 @@ _threading_battery.Thread(
     name="battery-opt-request",
 ).start()
 
-info = lambda *a, **k: print("[INFO]", *a, **k)
-warn = lambda *a, **k: print("[WARN]", *a, **k)
-err = lambda *a, **k: print("[ERROR]", *a, **k)
+def _tagged_log(tag: str, *args: Any, **kwargs: Any) -> None:
+    """把日志标签和正文一次性写入，避免 print 多参数被捕获成两条日志。
+
+    sys.stdout 已替换为 LogCapturer；print("[INFO]", message) 会分别调用
+    write("[INFO]")、write(" ")、write(message)，从而留下孤立的 [INFO]。
+    这里先拼成一个字符串，再只调用一次 print。
+    """
+    sep = str(kwargs.pop("sep", " "))
+    text = sep.join(str(value) for value in args)
+    line = f"{tag} {text}" if text else tag
+    print(line, **kwargs)
+
+
+def info(*args: Any, **kwargs: Any) -> None:
+    _tagged_log("[INFO]", *args, **kwargs)
+
+
+def warn(*args: Any, **kwargs: Any) -> None:
+    _tagged_log("[WARN]", *args, **kwargs)
+
+
+def err(*args: Any, **kwargs: Any) -> None:
+    _tagged_log("[ERROR]", *args, **kwargs)
 
 # ============================================================================
 # SECTION 2 · 网络连通性检测
@@ -3476,37 +3532,67 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     with _download_status_lock:
                         st = dict(_download_status)
                     log_lines = list(logs)
-                    
-                    # ★ 拼接常驻日志，确保可以在 App 查看状态
-                    # (原 android_filechooser 日志已整合到 android_native.get_status_logs() 中)
+
+                    # 拼接常驻日志时按“日志正文”去重。android_native.install() 在启动时
+                    # 会把文件选择/原生桥接状态打印到 stdout，这些内容已被 LogCapturer
+                    # 捕获；get_status_logs() 又返回同一批常驻状态。直接 extend 会导致
+                    # 日志窗口中同一组内容显示两遍（一组带“更新于”，一组不带）。
+                    def _log_identity(line: Any) -> str:
+                        text = str(line or "").strip()
+                        # LogCapturer 渲染时追加的更新时间不属于日志正文；
+                        # 等级也不参与正文去重，兼容 android_native 的原始常驻日志。
+                        text = re.sub(
+                            r"\s*\|\s*更新于\s+(?:\d{2}-\d{2}\s+)?"
+                            r"(?:(?:上午|下午|AM|PM)\s+)?\d{1,2}:\d{2}:\d{2}\s*$",
+                            "",
+                            text,
+                        )
+                        text = _LOG_LEVEL_RE.sub("", text, count=1)
+                        return re.sub(r"\s+", " ", text).strip()
+
+                    seen_log_lines = {
+                        ident for ident in (_log_identity(line) for line in log_lines) if ident
+                    }
+
+                    def _append_log_once(line: Any) -> None:
+                        text = str(line or "").strip()
+                        ident = _log_identity(text)
+                        if not ident or ident in seen_log_lines:
+                            return
+                        seen_log_lines.add(ident)
+                        log_lines.append(_with_log_level(text))
+
+                    # 原 android_filechooser 日志已整合到
+                    # android_native.get_status_logs() 中；只补充尚未捕获的状态。
                     try:
                         import android_native
-                        log_lines.extend(android_native.get_status_logs())
+                        for native_line in android_native.get_status_logs():
+                            _append_log_once(native_line)
                     except Exception:
                         pass
 
-                    # 新增：把"是否已加入电池白名单"也展示出来
+                    # 把“是否已加入电池白名单”也展示出来；同样避免与常驻状态重复。
                     try:
                         import android_native
                         if android_native.is_ignoring_battery_optimizations():
-                            log_lines.append("[电池优化] ✅ 已在白名单(应用不会被系统杀进程)")
+                            _append_log_once("[电池优化] ✅ 已在白名单(应用不会被系统杀进程)")
                         else:
-                            log_lines.append("[电池优化] ⚠️ 仍在电池优化名单中(建议在系统设置里放行)")
+                            _append_log_once("[电池优化] ⚠️ 仍在电池优化名单中(建议在系统设置里放行)")
                     except Exception:
                         pass
 
                     if st.get("remote_servers_available"):
                         ts = st.get("servers_last_success", 0)
-                        log_lines.append(f"[远程下载] 服务器列表: 正常 | 上次成功: {time.strftime('%H:%M:%S', time.localtime(ts))}")
+                        _append_log_once(f"[远程下载] 服务器列表: 正常 | 上次成功: {_format_log_time(ts)}")
                     else:
-                        log_lines.append("[远程下载] 服务器列表: 不可用（使用内置兜底）")
+                        _append_log_once("[远程下载] 服务器列表: 不可用（使用内置兜底）")
                     if st.get("chinese_db_last_error"):
                         ts = st.get("chinese_db_last_success", 0)
                         msg = f"标题映射: {st['chinese_db_last_error']}"
-                        log_lines.append(f"[远程下载] {msg} | 上次成功: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else f"[远程下载] {msg}")
+                        _append_log_once(f"[远程下载] {msg} | 上次成功: {_format_log_time(ts)}" if ts else f"[远程下载] {msg}")
                     else:
                         ts = st.get("chinese_db_last_success", 0)
-                        log_lines.append(f"[远程下载] 标题映射: 正常 | 上次成功: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "[远程下载] 标题映射: 正常")
+                        _append_log_once(f"[远程下载] 标题映射: 正常 | 上次成功: {_format_log_time(ts)}" if ts else "[远程下载] 标题映射: 正常")
                     data = {"ok": True, "logs": log_lines, "version": log_version}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
@@ -4151,7 +4237,8 @@ def main() -> None:
     port = int(os.getenv("PORT", "11451"))
     server_address = ("0.0.0.0", port)
     httpd = ThreadingHTTPServer(server_address, MonitorHandler)
-    info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 监控服务已启动，监听端口: {port}")
+    # LogCapturer 会统一追加“更新于 HH:MM:SS”，正文不再重复写完整时间。
+    info(f"[监控服务] ✅ 已启动，监听端口: {port}")
     info(f"[访问地址] http://0.0.0.0:{port}/")
 
     try:
