@@ -2045,10 +2045,46 @@ def room_stable_key(room: dict[str, Any], server_id: str = "") -> str:
     return f"{sid}:ch:{content}:{host}:{game}"
 
 
+def room_replacement_key(room: dict[str, Any], server_id: str = "") -> tuple[str, str, str] | None:
+    """返回房间重建前后不变的逻辑槽位标识。
+
+    sessionId 每次重新建房都会变化，不能用来判断“旧房间已被新房间替代”。
+    同一服务器中，已知游戏和房主的组合可用于立即淘汰保活缓存中的旧 session。
+    对缺失有效游戏/房主的数据不做替换判断，避免未知信息互相误合并。
+    """
+    sid = str(room.get("server_id") or server_id or "").strip()
+    content = str(room.get("content_id") or room.get("title_id") or "").strip().upper()
+    host = str(room.get("host") or room.get("node_id") or "").strip().casefold()
+    if not sid or not content or not host:
+        return None
+    if content == "FFFFFFFFFFFFFFFF" or host in {"未知玩家", "未命名玩家", "未知房间"}:
+        return None
+    return sid, content, host
+
+
+def room_display_key(room: dict[str, Any], server_id: str = "") -> tuple[Any, ...] | None:
+    """生成与房间卡片内容对应的键，用于合并同轮扫描中的完全重复项。"""
+    replacement_key = room_replacement_key(room, server_id)
+    if replacement_key is None:
+        return None
+    players_raw = room.get("players")
+    players = tuple(
+        str(player).strip().casefold()
+        for player in (players_raw if isinstance(players_raw, list) else [])
+    )
+    return (
+        *replacement_key,
+        players,
+        int_or_zero(room.get("node_count")),
+        int_or_zero(room.get("node_count_max")),
+    )
+
+
 def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """合并本轮扫描结果与保活缓存（内存优化版）。
 
     - 本轮扫到：重置 miss 计数并更新房间数据
+    - 重新建房：新 session 立即替换同游戏、同房主的旧 session
     - 本轮未扫到：miss + 1
     - miss >= ROOM_KEEPALIVE_MISSES：从卡片移除
 
@@ -2061,8 +2097,18 @@ def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) ->
     3. 增加每服务器保活房间数上限，防止异常数据把桶撑爆。
     """
     seen: dict[str, dict[str, Any]] = {}
+    seen_display_keys: dict[tuple[Any, ...], str] = {}
     for room in current_rooms:
-        seen[room_stable_key(room, server_id)] = room
+        rid = room_stable_key(room, server_id)
+        display_key = room_display_key(room, server_id)
+        if display_key is not None:
+            # GraphQL 与 UDP 可能在同一轮返回两个 sessionId 不同、但卡片内容
+            # 完全相同的房间；以后出现的 UDP 结果优先，避免直接渲染两份。
+            duplicate_rid = seen_display_keys.get(display_key)
+            if duplicate_rid is not None and duplicate_rid != rid:
+                seen.pop(duplicate_rid, None)
+            seen_display_keys[display_key] = rid
+        seen[rid] = room
 
     with _room_keepalive_lock:
         bucket = _room_keepalive.get(server_id)
@@ -2071,6 +2117,20 @@ def apply_room_keepalive(server_id: str, current_rooms: list[dict[str, Any]]) ->
                 return []
             bucket = {}
             _room_keepalive[server_id] = bucket
+
+        # 关闭后立即重新建房时 sessionId 会改变。旧 session 原本会继续保活
+        # 5 轮并与新 session 同时显示；若本轮已有同游戏、同房主的新 session，
+        # 说明旧项已被替代，应在加入新项前立即移除。
+        fresh_replacement_keys = {
+            key
+            for room in seen.values()
+            if (key := room_replacement_key(room, server_id)) is not None
+        }
+        if fresh_replacement_keys:
+            for rid in [k for k in bucket if k not in seen]:
+                old_key = room_replacement_key(bucket[rid][0], server_id)
+                if old_key is not None and old_key in fresh_replacement_keys:
+                    del bucket[rid]
 
         # 更新本轮出现的房间（复用已有 list 容器，避免重复分配）
         for rid, room in seen.items():
