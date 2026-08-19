@@ -1878,6 +1878,9 @@ def start_remote_download_thread():
                         _download_status["remote_servers_available"] = False
         except Exception as exc:
             err(f"[远程下载] 首次下载异常: {exc}")
+        # remote_download_worker() 进入循环后会立刻下载一次；若直接调用，启动阶段
+        # 会把标题库和服务器列表连续下载两遍。先等待一个周期再进入循环。
+        time.sleep(REMOTE_DOWNLOAD_INTERVAL)
         remote_download_worker()
 
     t = threading.Thread(target=_first_then_loop, daemon=True, name="remote-downloader")
@@ -2597,7 +2600,10 @@ class AppContext:
     def _config_signature() -> tuple:
         """用相关配置文件的 (mtime, size) 组成签名，变化才真正重载。"""
         sig: list[Any] = []
-        for p in (LOCAL_SERVERS_FILE, MANUAL_SERVERS_FILE, SERVERS_FILE, LOCAL_CHINESE_DB_FILE):
+        paths = dict.fromkeys(
+            (LOCAL_SERVERS_FILE, MANUAL_SERVERS_FILE, SERVERS_FILE, LOCAL_CHINESE_DB_FILE)
+        )
+        for p in paths:
             try:
                 st = os.stat(p)
                 sig.append((st.st_mtime_ns, st.st_size))
@@ -2800,13 +2806,6 @@ def _load_servers_merged() -> list[dict[str, Any]]:
     manual_path = Path(MANUAL_SERVERS_FILE)
     if manual_path.is_file():
         for srv in _load_servers_from_file(str(manual_path)):
-            if srv["id"] not in builtin_ids and srv["id"] not in remote_ids and srv["id"] not in env_ids:
-                srv.setdefault("is_manual", True)
-                merged[srv["id"]] = srv
-
-    env_manual = Path(SERVERS_FILE)
-    if env_manual.is_file() and str(env_manual) != str(manual_path):
-        for srv in _load_servers_from_file(str(env_manual)):
             if srv["id"] not in builtin_ids and srv["id"] not in remote_ids and srv["id"] not in env_ids:
                 srv.setdefault("is_manual", True)
                 merged[srv["id"]] = srv

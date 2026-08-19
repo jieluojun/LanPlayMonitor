@@ -4285,6 +4285,7 @@ html:not(.dark) {
       pollPaused: false,
       chatMessages: {},
       chatSubscribed: {},
+      chatSubscribing: {}, // serverId -> true，防止订阅成功前被每秒渲染重复订阅
       goEasyReady: false,
       goEasyRetries: 0,
       goEasyConfig: {}, // 来自 /api/env 的 goeasy 配置 {appkey, host, force_tls}
@@ -4292,6 +4293,7 @@ html:not(.dark) {
       storageConfig: {}, // 来自 /api/env 的 storage 配置 {provider: 'r2'|'cos'}
       publicMessages: [],
       publicChatReady: false,
+      publicChatSubscribing: false,
       username: "",
       userId: "",
       avatar: "",
@@ -5522,18 +5524,20 @@ html:not(.dark) {
 
     const netDot = document.getElementById("netDot");
     let netCheckTimer = null;
+    let networkCheckInFlight = false;
     let lastNetState = "";
     async function checkNetwork(force) {
-      if (!netDot) return;
+      if (!netDot || networkCheckInFlight) return;
       if (!navigator.onLine) {
-        netDot.classList.remove("online", "offline");
+        netDot.classList.remove("online", "offline", "checking");
         netDot.classList.add("offline");
         netDot.title = "网络已断开";
         lastNetState = "offline";
         return;
       }
-      const prevState = lastNetState;
+      networkCheckInFlight = true;
       netDot.classList.remove("online", "offline");
+      netDot.classList.add("checking");
       netDot.title = "检测网络...";
       lastNetState = "checking";
       try {
@@ -5555,17 +5559,14 @@ html:not(.dark) {
         netDot.classList.add("offline");
         netDot.title = "网络检测失败：" + e.message;
         lastNetState = "offline";
+      } finally {
+        networkCheckInFlight = false;
       }
-      if (
-        prevState &&
-        prevState !== lastNetState &&
-        lastNetState !== "checking"
-      )
-        setTimeout(() => checkNetwork(true), 3000);
     }
     function scheduleNetworkCheck() {
       if (netCheckTimer) clearInterval(netCheckTimer);
-      netCheckTimer = setInterval(checkNetwork, 2000);
+      // 与后端 5 秒状态缓存对齐，避免 2 秒轮询反复拿同一缓存结果。
+      netCheckTimer = setInterval(checkNetwork, 5000);
     }
     checkNetwork();
     scheduleNetworkCheck();
@@ -7130,15 +7131,39 @@ html:not(.dark) {
       }
     }
 
+    const _avatarProfileSyncInFlight = new Map();
+
     function syncAvatarFromGoEasyHistory(userId, onDone) {
       const id = String(userId || "").trim();
-      syncAvatarFromStorageBucket(id, function (bucketOk) {
-        if (bucketOk) {
-          if (typeof onDone === "function") onDone(true);
-          return;
-        }
-        _syncAvatarFromGoEasyHistoryLegacy(id, onDone);
-      });
+      if (!id) {
+        if (typeof onDone === "function") onDone(false);
+        return;
+      }
+      let promise = _avatarProfileSyncInFlight.get(id);
+      if (!promise) {
+        promise = new Promise(function (resolve) {
+          syncAvatarFromStorageBucket(id, function (bucketOk) {
+            if (bucketOk) {
+              resolve(true);
+              return;
+            }
+            _syncAvatarFromGoEasyHistoryLegacy(id, function (legacyOk) {
+              resolve(!!legacyOk);
+            });
+          });
+        });
+        _avatarProfileSyncInFlight.set(id, promise);
+        promise.then(
+          function () { _avatarProfileSyncInFlight.delete(id); },
+          function () { _avatarProfileSyncInFlight.delete(id); },
+        );
+      }
+      if (typeof onDone === "function") {
+        promise.then(
+          function (ok) { onDone(!!ok); },
+          function () { onDone(false); },
+        );
+      }
     }
 
     // 按 userId 定期用 R2 最新对象校准成员头像，修复异地设备持有旧 URL 的情况。
@@ -9733,27 +9758,6 @@ html:not(.dark) {
       );
     }
 
-    function _closeVideoLightbox() {
-      const s = _videoLightboxState;
-      if (!s.overlay) return;
-      s.overlay.classList.remove("open");
-      s.rotation = 0;
-      const player = s.video
-        ? s.video.closest(".chat-video-lightbox-player")
-        : null;
-      if (player) {
-        player.style.transform = "";
-        player.style.maxWidth = "";
-        player.style.maxHeight = "";
-      }
-      if (s.video) {
-        s.video.pause();
-        s.video.onloadedmetadata = null;
-        s.video.removeAttribute("src");
-        s.video.load();
-      }
-    }
-
     function _applyVideoRotation() {
       const s = _videoLightboxState;
       if (!s.video) return;
@@ -10906,7 +10910,7 @@ html:not(.dark) {
           if (state.goEasyReady && goEasy) {
             // 已连接则无需重复初始化
             subscribePublicChannel();
-            forceSubscribeAll();
+            subscribeAllChannels();
             return;
           }
           _goEasyInitInFlight = true;
@@ -10972,6 +10976,9 @@ html:not(.dark) {
               console.log("GoEasy 连接成功，用户ID:", goEasy.id);
               _goEasyInitInFlight = false;
               state.goEasyReady = true;
+              // 新连接代次清掉旧的“订阅中”标记，避免断线时未回调造成永久阻塞。
+              state.publicChatSubscribing = false;
+              state.chatSubscribing = {};
               // 自己刚连上：等 hereNow 拉完在线列表后再检查用户名冲突
               requestSelfUsernameConflictCheck();
               // 换回旧 ID 且本地无头像时，优先从 R2 稳定对象恢复，GoEasy 历史仅作兼容兜底
@@ -11271,23 +11278,31 @@ html:not(.dark) {
     }
 
     function subscribeChannel(serverId) {
-      if (!goEasy || !state.goEasyReady || state.chatSubscribed[serverId])
-        return;
+      if (
+        !goEasy ||
+        !state.goEasyReady ||
+        state.chatSubscribed[serverId] ||
+        state.chatSubscribing[serverId]
+      ) return;
       const channel = CHAT_PREFIX + serverId;
-      // 无本地缓存，或换回曾用过的用户 ID 时强制拉一次历史
+      // 历史只走一个入口：优先显式 history API；旧 SDK 才回退 subscribe.history。
       const needHistory = !state.hasChatHistoryCache || state.forceHistoryOnce;
-      const historyCount = needHistory ? HISTORY_LIMIT : 0;
-      goEasy.pubsub.subscribe({
+      const canUseHistoryApi =
+        !!goEasy.pubsub && typeof goEasy.pubsub.history === "function";
+      const historyCount = needHistory && !canUseHistoryApi ? HISTORY_LIMIT : 0;
+      state.chatSubscribing[serverId] = true;
+      try {
+        goEasy.pubsub.subscribe({
         channel: channel,
         history: historyCount,
         onMessage: function (message) {
           handleChatMessage(serverId, message.content);
         },
         onSuccess: function () {
+          delete state.chatSubscribing[serverId];
           state.chatSubscribed[serverId] = true;
           console.log(`订阅频道 ${channel} 成功 needHistory=${needHistory}`);
-          // 显式拉取历史：不依赖 subscribe 的 history 选项（部分环境不生效）
-          if (needHistory) {
+          if (needHistory && canUseHistoryApi) {
             loadChannelHistory(
               channel,
               function (message) {
@@ -11312,9 +11327,15 @@ html:not(.dark) {
                 renderChatMessages(serverId, true);
               },
             );
+          } else if (needHistory) {
+            // 旧 SDK 的 subscribe.history 会把历史投递到 onMessage。
+            markChatHistoryCached();
+            state.forceHistoryOnce = false;
+            renderChatMessages(serverId, true);
           }
         },
         onFailed: function (error) {
+          delete state.chatSubscribing[serverId];
           console.error(`订阅频道 ${channel} 失败`, error);
           setTimeout(() => {
             if (state.goEasyReady && !state.chatSubscribed[serverId]) {
@@ -11322,7 +11343,16 @@ html:not(.dark) {
             }
           }, 5000);
         },
-      });
+        });
+      } catch (error) {
+        delete state.chatSubscribing[serverId];
+        console.error(`订阅频道 ${channel} 调用异常`, error);
+        setTimeout(() => {
+          if (state.goEasyReady && !state.chatSubscribed[serverId]) {
+            subscribeChannel(serverId);
+          }
+        }, 5000);
+      }
     }
 
     function subscribeAllChannels() {
@@ -11335,10 +11365,9 @@ html:not(.dark) {
     function forceSubscribeAll() {
       if (!state.goEasyReady) return;
       state.chatSubscribed = {};
+      state.chatSubscribing = {};
       subscribeAllChannels();
-      // subscribePublicChannel 成功回调里会 initPresence / queryHereNow
-      subscribePublicChannel();
-      console.log("[聊天] 强制重新订阅所有频道");
+      console.log("[聊天] 强制重新订阅服务器频道");
     }
 
     // ---- 服务器聊天接收 ----
@@ -11711,10 +11740,21 @@ html:not(.dark) {
 
     // ---- 公共频道 ----
     function subscribePublicChannel() {
-      if (!goEasy || !state.goEasyReady || state.publicChatReady) return;
-      goEasy.pubsub.subscribe({
+      if (
+        !goEasy ||
+        !state.goEasyReady ||
+        state.publicChatReady ||
+        state.publicChatSubscribing
+      ) return;
+      const needPublicHistory =
+        !state.hasPublicHistoryCache || state.forceHistoryOnce;
+      const canUseHistoryApi =
+        !!goEasy.pubsub && typeof goEasy.pubsub.history === "function";
+      state.publicChatSubscribing = true;
+      try {
+        goEasy.pubsub.subscribe({
         channel: PUBLIC_CHANNEL,
-        history: state.hasPublicHistoryCache ? 0 : HISTORY_LIMIT,
+        history: needPublicHistory && !canUseHistoryApi ? HISTORY_LIMIT : 0,
         // 官方要求：订阅时开启 presence，该订阅才会被计入在线成员
         presence: { enable: true },
         onMessage: function (message) {
@@ -11818,6 +11858,7 @@ html:not(.dark) {
         },
         onSuccess: function () {
           console.log("公共频道订阅成功");
+          state.publicChatSubscribing = false;
           state.publicChatReady = true;
           // 当前 ID 若本地无头像，优先从 R2 恢复，GoEasy 历史仅作兼容兜底
           try {
@@ -11826,9 +11867,7 @@ html:not(.dark) {
               syncAvatarFromGoEasyHistory(state.userId || getStoredUserId());
             }
           } catch (e) {}
-          const needPublicHistory =
-            !state.hasPublicHistoryCache || state.forceHistoryOnce;
-          if (needPublicHistory) {
+          if (needPublicHistory && canUseHistoryApi) {
             loadChannelHistory(
               PUBLIC_CHANNEL,
               function (message) {
@@ -11870,7 +11909,13 @@ html:not(.dark) {
               },
             );
           } else {
-            savePublicMessages();
+            if (needPublicHistory) {
+              // 旧 SDK 的 subscribe.history 已通过 onMessage 投递历史。
+              markPublicHistoryCached();
+              state.forceHistoryOnce = false;
+            } else {
+              savePublicMessages();
+            }
             renderPublicChat(false);
           }
           restorePublicUnread();
@@ -11882,6 +11927,7 @@ html:not(.dark) {
           }
         },
         onFailed: function (error) {
+          state.publicChatSubscribing = false;
           console.error("公共频道订阅失败", error);
           setTimeout(() => {
             if (state.goEasyReady && !state.publicChatReady) {
@@ -11889,15 +11935,23 @@ html:not(.dark) {
             }
           }, 5000);
         },
-      });
+        });
+      } catch (error) {
+        state.publicChatSubscribing = false;
+        console.error("公共频道订阅调用异常", error);
+        setTimeout(() => {
+          if (state.goEasyReady && !state.publicChatReady) {
+            subscribePublicChannel();
+          }
+        }, 5000);
+      }
     }
 
     // ---- 在线成员 Presence ----
     function initPresence() {
       if (!goEasy || !state.goEasyReady) return;
-      // 确保已用 presence:enable 订阅 channel 之后再监听
+      // subscribePresence 成功/失败回调负责首次 hereNow，避免初始化时并发查询两次。
       subscribePresence();
-      queryHereNow();
       startPresencePolling();
     }
 
@@ -12095,47 +12149,6 @@ html:not(.dark) {
       });
     }
 
-    function notifyPresenceJoin(presenceEvent) {
-      if (!presenceEvent) return;
-      const action = presenceEvent.action;
-      if (action === "join" || action === "online" || action === "back") {
-        if (presenceEvent.member) {
-          notifyMemberOnline(presenceEvent.member);
-          return;
-        }
-      }
-      if (
-        action === "leave" ||
-        action === "offline" ||
-        action === "timeout" ||
-        action === "logout"
-      ) {
-        if (presenceEvent.member) notifyMemberOffline(presenceEvent.member);
-        return;
-      }
-      // 旧版 events 数组
-      if (Array.isArray(presenceEvent.events)) {
-        presenceEvent.events.forEach(function (ev) {
-          const a = ev.action;
-          if (a === "join" || a === "online" || a === "back") {
-            notifyMemberOnline({
-              id: ev.userId || (ev.member && ev.member.id),
-              data: ev.userData || (ev.member && ev.member.data),
-            });
-          } else if (
-            a === "leave" ||
-            a === "offline" ||
-            a === "timeout" ||
-            a === "logout"
-          ) {
-            notifyMemberOffline({
-              id: ev.userId || (ev.member && ev.member.id),
-            });
-          }
-        });
-      }
-    }
-
     function applyPresencePayload(payload, opts) {
       if (!payload) return false;
       opts = opts || {};
@@ -12244,19 +12257,6 @@ html:not(.dark) {
             state.onlineMembers.unshift(norm);
           }
           if (isNew && action !== "set") notifyMemberOnline(norm);
-          if (action === "set") {
-            document
-              .querySelectorAll(".chat-messages, #publicChatMessages")
-              .forEach(function (el) {
-                try {
-                  delete el.dataset.sig;
-                } catch (e) {}
-              });
-            state.servers.forEach(function (s) {
-              renderChatMessages(s.id, false);
-            });
-            renderPublicChat(false);
-          }
           listUpdated = true;
         } else if (
           action === "leave" ||
@@ -12357,6 +12357,17 @@ html:not(.dark) {
       return Array.from(map.values());
     }
 
+    let _hereNowRefreshTimer = null;
+    let _hereNowInFlight = false;
+
+    function scheduleHereNowRefresh(delay) {
+      if (_hereNowRefreshTimer) clearTimeout(_hereNowRefreshTimer);
+      _hereNowRefreshTimer = setTimeout(function () {
+        _hereNowRefreshTimer = null;
+        queryHereNow();
+      }, Math.max(0, Number(delay) || 0));
+    }
+
     function subscribePresence() {
       if (!goEasy || !state.goEasyReady) return;
       try {
@@ -12366,7 +12377,6 @@ html:not(.dark) {
           onPresence: function (presenceEvent) {
             try {
               console.log("[Presence] 事件:", presenceEvent);
-              notifyPresenceJoin(presenceEvent);
               const needRefresh = applyPresencePayload(presenceEvent, {
                 fromHereNow: false,
               });
@@ -12382,7 +12392,6 @@ html:not(.dark) {
                     : 250;
                 scheduleHereNowRefresh(delay);
               }
-              updateOnlineMembersUI();
             } catch (e) {
               console.warn("Presence 事件处理异常", e);
               scheduleHereNowRefresh(300);
@@ -12410,11 +12419,17 @@ html:not(.dark) {
 
     function queryHereNow() {
       if (!goEasy || !state.goEasyReady) return;
+      if (_hereNowInFlight) {
+        scheduleHereNowRefresh(300);
+        return;
+      }
+      _hereNowInFlight = true;
       try {
         goEasy.pubsub.hereNow({
           channel: PRESENCE_CHANNEL,
           limit: 100,
           onSuccess: function (response) {
+            _hereNowInFlight = false;
             try {
               console.log("[Presence] hereNow 响应:", response);
               const content =
@@ -12435,11 +12450,13 @@ html:not(.dark) {
             }
           },
           onFailed: function (error) {
+            _hereNowInFlight = false;
             console.warn("[Presence] hereNow 失败", error);
             tryLegacyHereNow();
           },
         });
       } catch (e) {
+        _hereNowInFlight = false;
         console.warn("[Presence] hereNow 调用异常", e);
         tryLegacyHereNow();
       }
@@ -13106,14 +13123,7 @@ html:not(.dark) {
       const plusBtn = document.getElementById("publicChatPlusBtn");
       const plusPanel = document.getElementById("publicChatPlusPanel");
       const voiceBtn = document.getElementById("publicChatVoiceBtn");
-      const autoGrow = (el) => {
-        if (!el) return;
-        el.style.height = "auto";
-        el.style.height = Math.min(el.scrollHeight, 120) + "px";
-      };
-      [input, ...document.querySelectorAll(".chat-input")].forEach(
-        (el) => el && el.addEventListener("input", () => autoGrow(el)),
-      );
+      // 输入框自动增高由文件末尾的全局委托单例统一处理，避免每个输入框重复绑定。
 
       // 绑定滚动事件保存位置
       const pubContainer = document.getElementById("publicChatMessages");
@@ -13947,7 +13957,6 @@ html:not(.dark) {
           });
         }
 
-        checkNetwork(true);
       } catch (e) {
         state.servers.forEach((s) => {
           s.status = "offline";
@@ -13955,7 +13964,11 @@ html:not(.dark) {
           s.error = "网络连接失败";
         });
         render();
-        checkNetwork(true);
+        if (netDot) {
+          netDot.classList.remove("online", "checking");
+          netDot.classList.add("offline");
+          netDot.title = "网络连接失败";
+        }
       } finally {
         state.loading = false;
       }
@@ -15062,6 +15075,7 @@ html:not(.dark) {
       if (refreshTimer) clearTimeout(refreshTimer);
       if (goEasyInitTimer) clearTimeout(goEasyInitTimer);
       if (presenceRefreshTimer) clearInterval(presenceRefreshTimer);
+      if (_hereNowRefreshTimer) clearTimeout(_hereNowRefreshTimer);
       if (window._envSecurityRefreshTimer) {
         clearInterval(window._envSecurityRefreshTimer);
         window._envSecurityRefreshTimer = null;
