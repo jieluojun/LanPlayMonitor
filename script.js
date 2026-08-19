@@ -13668,10 +13668,9 @@ html:not(.dark) {
     });
 
     // ===== 筛选器渲染 =====
-    // 房间保活：与「全部」相同（后端 + 前端 5 次）
-    // 游戏标题栏：跟随保活后的房间；该游戏保活房间归零后标签消失并回退到「总房间」
-    const ROOM_KEEP_MISSES = 5;
-    const _roomKeepClient = Object.create(null); // key -> { room, misses }
+    // 房间保活只由后端统一执行 5 次；前端直接使用后端快照，避免重复保活导致
+    // 房间实际需要约 9～10 次未命中后才消失。
+    // 游戏标题栏跟随后端保活后的房间；房间归零后标签立即消失并回退到「总房间」。
 
     function normalizeFilterGame(game, room) {
       // 传 room 时走完整解析；只传字符串时做兼容处理
@@ -13692,35 +13691,6 @@ html:not(.dark) {
 
     function isUnknownFilterGame(game) {
       return normalizeFilterGame(game) === "未知游戏";
-    }
-
-    function roomClientKey(r) {
-      return [
-        r.server_id || "",
-        r.id || "",
-        r.content_id || "",
-        r.host || "",
-        resolveRoomGameLabel(r),
-      ].join("|");
-    }
-
-    // 前端房间保活：全部 / 总房间 / 各游戏筛选共用
-    function applyClientRoomKeepalive(incoming) {
-      const seen = Object.create(null);
-      (incoming || []).forEach((r) => {
-        const k = roomClientKey(r);
-        seen[k] = true;
-        _roomKeepClient[k] = { room: r, misses: 0 };
-      });
-      Object.keys(_roomKeepClient).forEach((k) => {
-        if (seen[k]) return;
-        _roomKeepClient[k].misses =
-          (Number(_roomKeepClient[k].misses) || 0) + 1;
-        if (_roomKeepClient[k].misses >= ROOM_KEEP_MISSES) {
-          delete _roomKeepClient[k];
-        }
-      });
-      return Object.keys(_roomKeepClient).map((k) => _roomKeepClient[k].room);
     }
 
     // 从保活后的房间列表提取游戏标签
@@ -13930,9 +13900,9 @@ html:not(.dark) {
         const data = await getJSON(url);
 
         state.servers = Array.isArray(data.servers) ? data.servers : [];
-        // 全部 / 总房间 / 游戏筛选共用保活后的房间列表
-        const rawRooms = Array.isArray(data.rooms) ? data.rooms : [];
-        state.rooms = applyClientRoomKeepalive(rawRooms);
+        // 后端已经完成连续 5 次未命中的房间保活；前端必须直接采用该快照。
+        // 若前端再次累计 5 次，会形成双重保活，让关闭的房间额外滞留数秒。
+        state.rooms = Array.isArray(data.rooms) ? data.rooms : [];
 
         // 以服务端列表为准：排序缓存里已不存在的 id 直接丢掉，防止已删自定义服务器「阴魂不散」
         try {
