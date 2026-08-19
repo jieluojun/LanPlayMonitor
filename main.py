@@ -350,7 +350,7 @@ DEFAULT_SERVERS_FILE = MANUAL_SERVERS_FILE
 REMOTE_DOWNLOAD_INTERVAL = 60
 APP_NAME = "lan-play-room-monitor"
 CACHE_TTL = max(1, float(os.getenv("CACHE_TTL", "1")))
-REQUEST_TIMEOUT = max(1, float(os.getenv("REQUEST_TIMEOUT", "1")))
+REQUEST_TIMEOUT = max(1, float(os.getenv("REQUEST_TIMEOUT", "3")))
 # 扫描线程数：原为 32（上限 64）。每个线程 = 一个栈 + 一份运行时对象，
 # 而扫描是 IO 密集且服务器通常只有个位数台，开这么多纯属浪费常驻内存。
 # 现按“服务器数”自适应，最多 8。
@@ -2300,7 +2300,7 @@ query PublicRoomSnapshot {
 }
 """.strip()
 
-UDP_SCAN_SECONDS = max(0.5, float(os.getenv("UDP_SCAN_SECONDS", "0.5")))
+UDP_SCAN_SECONDS = max(1, float(os.getenv("UDP_SCAN_SECONDS", "1")))
 LDN_PORT = 11452
 LDN_MAGIC = bytes.fromhex("00144511")
 LDN_SCAN_HEADER = LDN_MAGIC + bytes(8)
