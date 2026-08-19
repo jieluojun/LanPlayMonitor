@@ -12,7 +12,6 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import socket
 import struct
 import sys
@@ -1183,7 +1182,8 @@ def parse_multipart(body: bytes, content_type: str) -> list[dict[str, Any]]:
 # SECTION 3.6 · 环境变量配置（env.json 可视化编辑）
 # 将 GoEasy（聊天）与 Cloudflare R2（存储桶）两类配置分开保存到一个
 # JSON 文件里；若文件不存在会自动创建。保存 R2 配置后会即时应用到运行时。
-# 安全密码（加盐哈希）也一并保存在 env.json 的 security 字段中。
+# 安全密码（明文）保存在 env.json 的 security.password 字段中，
+# 也可通过 OS 环境变量 SECURITY_PASSWORD 注入（OS 优先）。
 # ============================================================================
 
 ENV_CONFIG_FILE = str(SCRIPT_DIR / "env.json")
@@ -1218,10 +1218,9 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
         "max_upload_mb": COS_MAX_UPLOAD_MB if COS_MAX_UPLOAD_MB > 0 else "",
         "max_storage_mb": COS_MAX_STORAGE_MB if COS_MAX_STORAGE_MB > 0 else "",
     },
-    "security": {                           # 新增：存储密码哈希
-        "password_hash": "",
-        "salt": "",
-        "set_at": 0.0,
+    "security": {
+        # 明文安全密码；也可用 OS 环境变量 SECURITY_PASSWORD（优先级更高）
+        "password": "",
     },
 }
 
@@ -1379,7 +1378,13 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
         existing = {}
 
     # 深度合并传入的数据（递归合并字典，其他类型直接覆盖）
+    # security 特例：整段替换为单一 password 字段，避免残留旧版
+    # password_hash / salt / set_at。
     for key, value in data.items():
+        if key == "security" and isinstance(value, dict):
+            pw = str(value.get("password", "") or "").strip()
+            existing["security"] = {"password": pw}
+            continue
         if isinstance(value, dict) and key in existing and isinstance(existing[key], dict):
             existing[key].update(value)
         else:
@@ -1388,7 +1393,13 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     # 确保必要 section 存在
     for section in ("goeasy", "storage", "cloudflare_r2", "tencent_cos", "security"):
         if section not in existing:
-            existing[section] = {}
+            existing[section] = {} if section != "security" else {"password": ""}
+    # 规整 security：只保留 password
+    sec = existing.get("security")
+    if not isinstance(sec, dict):
+        existing["security"] = {"password": ""}
+    else:
+        existing["security"] = {"password": str(sec.get("password", "") or "").strip()}
 
     Path(ENV_CONFIG_FILE).write_text(
         json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1409,11 +1420,13 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
 
 # ============================================================================
 # SECTION 3.7 · 环境变量配置安全（公网强制密码 + 局域网跳过）
-# 安全密码（加盐哈希）保存在 env.json 的 security 字段中；一旦设置，
-# 之后无论局域网/公网修改配置都需输入正确密码。
+# 安全密码以明文保存在 env.json 的 security.password；也可通过 OS 环境变量
+# SECURITY_PASSWORD 注入（OS 优先于文件）。一旦设置，之后无论局域网/公网
+# 修改配置都需输入正确密码。
 # ============================================================================
 
-# 注意：不再使用独立的 SECURITY_FILE 常量，所有数据存于 env.json 的 security 字段。
+# 注意：不再使用独立的 SECURITY_FILE 常量；不再使用加盐哈希三字段
+# （password_hash / salt / set_at），统一为单一明文 password。
 
 # 局域网/保留地址段一律视为「非公网」
 _PRIVATE_NETWORKS = (
@@ -1565,49 +1578,81 @@ def is_public_request(handler: Any) -> tuple[bool, str]:
         return ("." in host), client_ip
 
 
-def _hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+def _security_password_from_os() -> str:
+    """读取 OS 环境变量中的安全密码（SECURITY_PASSWORD）。"""
+    return os.getenv("SECURITY_PASSWORD", "").strip()
 
 
 def load_security() -> dict[str, Any]:
-    """从 env.json 读取 security 配置"""
+    """读取生效中的 security 配置。
+
+    优先级：OS 环境变量 SECURITY_PASSWORD > env.json 的 security.password。
+    统一暴露为单一明文字段 password（不再使用 password_hash / salt / set_at）。
+    """
+    env_pw = _security_password_from_os()
+    if env_pw:
+        return {"password": env_pw, "source": "env"}
+
     cfg = load_env_config()
     sec = cfg.get("security") if isinstance(cfg.get("security"), dict) else {}
-    sec.setdefault("password_hash", "")
-    sec.setdefault("salt", "")
-    sec.setdefault("set_at", 0.0)
-    return sec
+    # 兼容：若旧版只残留 password_hash 而无 password，视为未设置（需重新设明文密码）
+    password = str(sec.get("password", "") or "").strip()
+    return {"password": password, "source": "file" if password else ""}
 
 
 def is_password_set() -> bool:
-    return bool(load_security().get("password_hash"))
+    """是否已配置安全密码（OS 环境变量或 env.json 任一非空即算已设置）。"""
+    return bool(load_security().get("password"))
 
 
 def verify_password(password: Any) -> bool:
     """校验密码；未设置密码时恒为通过。"""
-    sec = load_security()
-    h = sec.get("password_hash")
-    if not h:
+    expected = load_security().get("password") or ""
+    if not expected:
         return True
-    salt = sec.get("salt", "")
-    return h == _hash_password(str(password or ""), salt)
+    return str(password or "") == expected
 
 
 def set_security_password(password: str) -> bool:
-    """设置/修改安全密码（存入 env.json 的 security 字段）。"""
+    """设置/修改安全密码（明文写入 env.json 的 security.password）。
+
+    注意：若进程同时配置了 OS 环境变量 SECURITY_PASSWORD，运行时校验仍以
+    OS 变量为准；本函数只更新 env.json，不会改写进程环境变量。
+    """
     if not password or len(password) < 4:
         raise ValueError("安全密码长度至少为 4 位")
-    salt = secrets.token_hex(16)
-    new_hash = _hash_password(password, salt)
 
-    cfg = load_env_config()
-    cfg["security"] = {
-        "password_hash": new_hash,
-        "salt": salt,
-        "set_at": time.time(),
-    }
-    save_env_config(cfg)
-    info(f"[安全] 环境变量配置安全密码已保存至 {ENV_CONFIG_FILE}")
+    # 直接整段替换 security，避免 save_env_config 的 dict.update 残留
+    # 旧版 password_hash / salt / set_at 字段。
+    ensure_env_config()
+    try:
+        existing = json.loads(Path(ENV_CONFIG_FILE).read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except Exception:
+        existing = copy.deepcopy(DEFAULT_ENV_CONFIG)
+
+    existing["security"] = {"password": str(password)}
+    # 确保必要 section 存在
+    for section in ("goeasy", "storage", "cloudflare_r2", "tencent_cos", "security"):
+        if section not in existing:
+            existing[section] = {}
+
+    Path(ENV_CONFIG_FILE).write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # 同步 mtime 指纹，避免随后上传路径误判文件变化
+    global _env_config_applied_mtime
+    try:
+        _env_config_applied_mtime = Path(ENV_CONFIG_FILE).stat().st_mtime_ns
+    except OSError:
+        _env_config_applied_mtime = None
+
+    src_note = ""
+    if _security_password_from_os():
+        src_note = "（提示：当前 SECURITY_PASSWORD 环境变量已设置，运行时校验仍以 OS 变量为准）"
+    info(f"[安全] 环境变量配置安全密码已保存至 {ENV_CONFIG_FILE}{src_note}")
     return True
 
 
@@ -3373,13 +3418,23 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     else:
                         allow_full = True
 
+                    # 下发前把 security 规整为单一明文 password + source
+                    # （OS SECURITY_PASSWORD 优先；不暴露旧版 hash 字段）
+                    out_cfg = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+                    sec_eff = load_security()
+                    out_cfg["security"] = {
+                        "password": str(sec_eff.get("password", "") or ""),
+                        "source": str(sec_eff.get("source", "") or ""),
+                    }
                     data = {
                         "ok": True,
-                        "config": cfg,
+                        "config": out_cfg,
                         "file": ENV_CONFIG_FILE,
                         "full": True,
                         "is_public": is_public,
                         "client_ip": client_ip,
+                        "password_set": True if password_set else False,
+                        "password_source": out_cfg["security"]["source"],
                     }
                     body, headers, status = make_json_response(data)
                     headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -3395,10 +3450,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if path == "/api/env/security-status":
                 try:
                     is_public, client_ip = is_public_request(self)
+                    sec = load_security()
                     data = {
                         "ok": True,
                         "is_public": is_public,
-                        "password_set": is_password_set(),
+                        "password_set": bool(sec.get("password")),
+                        "password_source": str(sec.get("source", "") or ""),
                         "client_ip": client_ip,
                     }
                     body, headers, status = make_json_response(data)
@@ -3977,7 +4034,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
                             raise PermissionError("需要正确的旧密码才能修改安全密码")
                     password = str(req_json.get("password", ""))
                     set_security_password(password)
-                    data = {"ok": True}
+                    sec = load_security()
+                    data = {
+                        "ok": True,
+                        "password_set": bool(sec.get("password")),
+                        "password_source": str(sec.get("source", "") or ""),
+                    }
                     body, headers, status = make_json_response(data)
                 except PermissionError as e:
                     data = {"ok": False, "error": str(e)}
@@ -4004,12 +4066,40 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if path == "/api/env/save":
                 try:
                     # 安全：若已设置密码，必须提供正确密码才能修改配置
+                    # 注意：body.password 仅用于鉴权，不能写入 env.json
+                    auth_pw = str(req_json.pop("password", "") or "")
                     if is_password_set():
-                        pw = str(req_json.get("password", ""))
-                        if not verify_password(pw):
+                        if not verify_password(auth_pw):
                             raise PermissionError("需要正确的安全密码才能修改环境变量配置")
+
+                    # security 统一为单一明文 password；OS 环境变量生效时拒绝表单覆盖
+                    if "security" in req_json:
+                        sec_in = req_json.get("security")
+                        if not isinstance(sec_in, dict):
+                            raise ValueError("security 必须是对象")
+                        new_pw = str(sec_in.get("password", "") or "").strip()
+                        if _security_password_from_os():
+                            # 运行时以 SECURITY_PASSWORD 为准，忽略表单写入，避免误导
+                            req_json.pop("security", None)
+                        else:
+                            if new_pw and len(new_pw) < 4:
+                                raise ValueError("安全密码长度至少为 4 位")
+                            req_json["security"] = {"password": new_pw}
+
                     cfg = save_env_config(req_json)
-                    data = {"ok": True, "config": cfg, "file": ENV_CONFIG_FILE}
+                    # 响应里同样返回生效中的 security（含 OS 覆盖）
+                    out_cfg = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+                    sec_eff = load_security()
+                    out_cfg["security"] = {
+                        "password": str(sec_eff.get("password", "") or ""),
+                        "source": str(sec_eff.get("source", "") or ""),
+                    }
+                    data = {
+                        "ok": True,
+                        "config": out_cfg,
+                        "file": ENV_CONFIG_FILE,
+                        "password_source": out_cfg["security"]["source"],
+                    }
                     body, headers, status = make_json_response(data)
                 except PermissionError as e:
                     data = {"ok": False, "error": str(e), "need_password": True}

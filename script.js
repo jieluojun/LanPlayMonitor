@@ -4069,6 +4069,17 @@ html:not(.dark) {
           </div>
         </div>
 
+        <div class="env-section" id="envSectionSecurity">
+          <div class="env-section-title">🔒 安全密码</div>
+          <div class="form-grid">
+            <div class="form-row">
+              <label class="env-field-label"><span class="env-field-key">password</span> · 环境变量配置安全密码（明文）</label>
+              <input type="password" class="env-field" id="envSecurityPassword" placeholder="至少 4 位；留空表示清除（仅文件来源）" autocomplete="new-password" spellcheck="false">
+            </div>
+            <div class="env-save-tip" id="envSecurityTip">用于保护环境变量配置页。也可通过 OS 环境变量 <code>SECURITY_PASSWORD</code> 注入（优先级更高）。保存时会写入 env.json 的 security.password。</div>
+          </div>
+        </div>
+
         <button type="button" id="envSettingsSaveBtn" class="submit-btn">
           <span class="spinner"></span>
           <span class="btn-text">💾 保存并应用</span>
@@ -14058,8 +14069,10 @@ html:not(.dark) {
     }
 
     // ===== 环境变量安全：公网强制密码 / 局域网跳过 =====
+    // 安全密码为单一明文（env.json security.password 或 OS SECURITY_PASSWORD）。
     // 一旦设置过安全密码，之后无论局域网/公网都需输入密码才能修改。
-    let _envVerifiedPassword = ""; // 本次会话已通过验证的密码（用于保存配置）
+    let _envVerifiedPassword = ""; // 本次会话已通过验证的密码（用于鉴权保存/读取）
+    let _envPasswordSource = ""; // "env" | "file" | "" — 当前生效来源
 
     function _showEnvSecurityModal(title, bodyHtml, submitText, onSubmit) {
       const old = document.getElementById("envSecurityModal");
@@ -14138,7 +14151,7 @@ html:not(.dark) {
     function forceSetPassword(onDone) {
       _showEnvSecurityModal(
         "🔒 设置安全密码",
-        '<div style="font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:4px;">当前为公网访问，为防止他人篡改环境变量配置，请先设置一个安全密码（至少 4 位）。</div>' +
+        '<div style="font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:4px;">当前为公网访问，为防止他人篡改环境变量配置，请先设置一个安全密码（至少 4 位，明文保存；也可事先配置 OS 环境变量 SECURITY_PASSWORD）。</div>' +
           '<div class="form-row"><input type="password" id="envSecPwd" class="env-field" placeholder="设置安全密码" autocomplete="new-password"></div>' +
           '<div class="form-row"><input type="password" id="envSecPwd2" class="env-field" placeholder="再次输入以确认（二次确认）" autocomplete="new-password"></div>',
         "🔐 设置并进入",
@@ -14161,8 +14174,15 @@ html:not(.dark) {
           const d = await r.json().catch(() => ({}));
           if (!r.ok || !d.ok) throw new Error((d && d.error) || "设置失败");
           _envVerifiedPassword = p1;
+          _envPasswordSource = (d && d.password_source) || "file";
+          if (_envSecurityCache) {
+            _envSecurityCache.password_set = true;
+            _envSecurityCache.password_source = _envPasswordSource;
+            _envSecurityCache.at = Date.now();
+          }
+          state.envPasswordSet = true;
           close();
-          showToast("✅ 安全密码已设置", 1800, true);
+          showToast("✅ 安全密码已设置（明文写入 env.json）", 1800, true);
           onDone && onDone();
         },
       );
@@ -14172,7 +14192,7 @@ html:not(.dark) {
     function requirePasswordToOpen(onDone) {
       _showEnvSecurityModal(
         "🔒 输入安全密码",
-        '<div style="font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:4px;">该环境变量配置已受安全密码保护，请输入密码后才能修改。</div>' +
+        '<div style="font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:4px;">该环境变量配置已受安全密码保护（env.json 明文或 OS 环境变量 SECURITY_PASSWORD），请输入密码后才能修改。</div>' +
           '<div class="form-row"><input type="password" id="envSecPwd" class="env-field" placeholder="安全密码" autocomplete="current-password"></div>',
         "🔓 验证并进入",
         async function (modal, setLoading, showErr, close) {
@@ -14219,10 +14239,12 @@ html:not(.dark) {
             _envSecurityCache = {
               is_public: !!st.is_public,
               password_set: !!st.password_set,
+              password_source: st.password_source || "",
               at: Date.now(),
             };
             state.envIsPublic = _envSecurityCache.is_public;
             state.envPasswordSet = _envSecurityCache.password_set;
+            _envPasswordSource = _envSecurityCache.password_source || "";
           }
           return _envSecurityCache;
         })
@@ -14401,9 +14423,34 @@ html:not(.dark) {
             storage.provider === "cos" ? "cos" : "r2",
           );
           updateStorageProviderSections();
+          // 安全密码：单一明文字段；source=env 时表示 OS SECURITY_PASSWORD 生效
+          const sec =
+            d.config.security && typeof d.config.security === "object"
+              ? d.config.security
+              : {};
+          const pwSource =
+            (d.password_source || sec.source || _envPasswordSource || "").toString();
+          _envPasswordSource = pwSource;
+          setVal("envSecurityPassword", sec.password || "");
+          const secInput = document.getElementById("envSecurityPassword");
+          const secTip = document.getElementById("envSecurityTip");
+          const fromOs = pwSource === "env";
+          if (secInput) {
+            secInput.disabled = !!fromOs;
+            secInput.placeholder = fromOs
+              ? "当前由 OS 环境变量 SECURITY_PASSWORD 提供（只读）"
+              : "至少 4 位；留空表示清除文件中的密码";
+          }
+          if (secTip) {
+            secTip.innerHTML = fromOs
+              ? '当前生效来源：<b>OS 环境变量 SECURITY_PASSWORD</b>（优先级最高，表单不可覆盖；修改请改部署环境变量后重启）。'
+              : '用于保护环境变量配置页。写入 <code>env.json</code> 的 <code>security.password</code>（明文）。也可通过 OS 环境变量 <code>SECURITY_PASSWORD</code> 注入（优先级更高）。留空并保存可清除文件中的密码。';
+          }
           if (d.config.goeasy) state.goEasyConfig = d.config.goeasy;
           if (d.config.cloudflare_r2) state.r2Config = d.config.cloudflare_r2;
           if (d.config.storage) state.storageConfig = d.config.storage;
+          if (d.config.security) state.envSecurityConfig = d.config.security;
+          state.envPasswordSet = !!(sec.password || d.password_set);
         } catch (e) {
           console.warn("[env配置] 加载失败", e);
           showToast(
@@ -14457,8 +14504,24 @@ html:not(.dark) {
               ? parseInt(val("envCosMaxStorageMb"), 10)
               : "",
           },
+          // 单一明文安全密码（后端会忽略 OS SECURITY_PASSWORD 生效时的写入）
+          security: {
+            password: val("envSecurityPassword"),
+          },
         };
+        // body.password 仅用于鉴权，不会写入 security
         if (_envVerifiedPassword) payload.password = _envVerifiedPassword;
+        // 前端预检：非 OS 来源时，非空密码至少 4 位
+        if (_envPasswordSource !== "env") {
+          const sp = (payload.security.password || "").trim();
+          if (sp && sp.length < 4) {
+            showToast("❌ 安全密码至少需要 4 位（或留空清除）", 2500, false);
+            saveBtn.disabled = false;
+            saveBtn.classList.remove("loading");
+            return;
+          }
+          payload.security.password = sp;
+        }
         try {
           const r = await fetch("/api/env/save", {
             method: "POST",
@@ -14467,6 +14530,24 @@ html:not(.dark) {
           });
           const d = await r.json().catch(() => ({}));
           if (!r.ok || !d.ok) throw new Error((d && d.error) || "保存失败");
+          // 若用户在表单里改了安全密码，会话鉴权密码同步为新值
+          if (_envPasswordSource !== "env") {
+            const sp = (payload.security && payload.security.password) || "";
+            if (sp) {
+              _envVerifiedPassword = sp;
+              state.envPasswordSet = true;
+            } else {
+              // 清除文件密码后，若后端也确认未设密码，则会话不再需要鉴权
+              _envVerifiedPassword = "";
+              state.envPasswordSet = false;
+            }
+            _envPasswordSource = (d && d.password_source) || (sp ? "file" : "");
+            if (_envSecurityCache) {
+              _envSecurityCache.password_set = !!state.envPasswordSet;
+              _envSecurityCache.password_source = _envPasswordSource;
+              _envSecurityCache.at = Date.now();
+            }
+          }
           if (d.file) state.envConfigFile = d.file;
           const pathEl = document.getElementById("envFilePath");
           if (pathEl) pathEl.textContent = "配置文件：" + d.file;
