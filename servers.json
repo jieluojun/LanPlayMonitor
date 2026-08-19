@@ -94,13 +94,5 @@
     "port": 11451,
     "type": "graphql",
     "region": "🇩🇪 德国 萨克森"
-  },
-  {
-    "id": "13",
-    "name": "tomodachilife",
-    "host": "8.138.237.87",
-    "port": 11451,
-    "type": "graphql",
-    "region": "🇨🇳 中国 广东 广州"
   }
 ]
