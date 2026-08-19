@@ -1250,6 +1250,9 @@ def load_env_config() -> dict[str, Any]:
     try:
         data = json.loads(Path(ENV_CONFIG_FILE).read_text(encoding="utf-8"))
         if isinstance(data, dict):
+            # 兼容清理：历史误把鉴权 password 写到顶层的脏数据，读时剥离（不在此路径落盘）
+            data.pop("password", None)
+            data.pop("old_password", None)
             return data
         warn("[env配置] 配置文件格式不是对象，使用默认值")
     except FileNotFoundError:
@@ -1377,10 +1380,21 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         existing = {}
 
+    # 鉴权字段只会出现在 API body 顶层，绝不能落盘到 env.json。
+    # 同时清掉历史误写入的顶层 password / old_password。
+    _AUTH_ONLY_TOP_KEYS = ("password", "old_password", "need_password")
+    if isinstance(data, dict):
+        for k in _AUTH_ONLY_TOP_KEYS:
+            data.pop(k, None)
+    for k in _AUTH_ONLY_TOP_KEYS:
+        existing.pop(k, None)
+
     # 深度合并传入的数据（递归合并字典，其他类型直接覆盖）
     # security 特例：整段替换为单一 password 字段，避免残留旧版
     # password_hash / salt / set_at。
     for key, value in data.items():
+        if key in _AUTH_ONLY_TOP_KEYS:
+            continue
         if key == "security" and isinstance(value, dict):
             pw = str(value.get("password", "") or "").strip()
             existing["security"] = {"password": pw}
@@ -1394,12 +1408,14 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
     for section in ("goeasy", "storage", "cloudflare_r2", "tencent_cos", "security"):
         if section not in existing:
             existing[section] = {} if section != "security" else {"password": ""}
-    # 规整 security：只保留 password
+    # 规整 security：只保留 password；并再次清掉顶层鉴权脏字段
     sec = existing.get("security")
     if not isinstance(sec, dict):
         existing["security"] = {"password": ""}
     else:
         existing["security"] = {"password": str(sec.get("password", "") or "").strip()}
+    for k in _AUTH_ONLY_TOP_KEYS:
+        existing.pop(k, None)
 
     Path(ENV_CONFIG_FILE).write_text(
         json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -4066,8 +4082,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if path == "/api/env/save":
                 try:
                     # 安全：若已设置密码，必须提供正确密码才能修改配置
-                    # 注意：body.password 仅用于鉴权，不能写入 env.json
+                    # 注意：body 顶层 password / old_password 仅用于鉴权，不能写入 env.json
+                    if not isinstance(req_json, dict):
+                        raise ValueError("请求体必须是 JSON 对象")
                     auth_pw = str(req_json.pop("password", "") or "")
+                    req_json.pop("old_password", None)
                     if is_password_set():
                         if not verify_password(auth_pw):
                             raise PermissionError("需要正确的安全密码才能修改环境变量配置")

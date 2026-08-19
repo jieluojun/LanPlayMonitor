@@ -5075,6 +5075,41 @@ html:not(.dark) {
           });
           const d = await res.json().catch(() => ({}));
           if (!res.ok || !d.ok) throw new Error(d.error || "删除失败");
+          // 立刻从本地状态与缓存剔除，避免多实例/旧 cache 造成「删了还在」
+          try {
+            state.servers = (state.servers || []).filter(function (s) {
+              return s && s.id !== id;
+            });
+            state.rooms = (state.rooms || []).filter(function (r) {
+              return r && r.server_id !== id;
+            });
+            if (state._domCache && state._domCache.get) {
+              var el = state._domCache.get(id);
+              if (el && el.remove) el.remove();
+              state._domCache.delete(id);
+            }
+            localStorage.setItem(
+              "lan_play_cache_servers",
+              JSON.stringify(state.servers),
+            );
+            localStorage.setItem(
+              "lan_play_cache_rooms",
+              JSON.stringify(state.rooms),
+            );
+            var orderRaw = localStorage.getItem("lan_play_server_order");
+            if (orderRaw) {
+              var orderArr = JSON.parse(orderRaw);
+              if (Array.isArray(orderArr)) {
+                localStorage.setItem(
+                  "lan_play_server_order",
+                  JSON.stringify(orderArr.filter(function (x) { return x !== id; })),
+                );
+              }
+            }
+            render();
+          } catch (cacheErr) {
+            console.warn("[删除] 清理本地缓存失败", cacheErr);
+          }
           await load(true);
           showToast("🗑️ 服务器「" + name + "」删除成功！", 2000, true);
         } catch (e) {
@@ -13898,6 +13933,19 @@ html:not(.dark) {
         // 全部 / 总房间 / 游戏筛选共用保活后的房间列表
         const rawRooms = Array.isArray(data.rooms) ? data.rooms : [];
         state.rooms = applyClientRoomKeepalive(rawRooms);
+
+        // 以服务端列表为准：排序缓存里已不存在的 id 直接丢掉，防止已删自定义服务器「阴魂不散」
+        try {
+          const liveIds = new Set(state.servers.map((s) => s && s.id).filter(Boolean));
+          const orderRaw = localStorage.getItem("lan_play_server_order");
+          if (orderRaw) {
+            const orderArr = JSON.parse(orderRaw);
+            if (Array.isArray(orderArr)) {
+              const pruned = orderArr.filter((x) => liveIds.has(x));
+              localStorage.setItem("lan_play_server_order", JSON.stringify(pruned));
+            }
+          }
+        } catch (e) { /* ignore */ }
 
         if (ignoreSaved) {
           state._defaultOrder = state.servers.map((s) => ({ id: s.id }));
