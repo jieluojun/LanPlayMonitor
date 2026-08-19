@@ -1683,24 +1683,53 @@ _download_status: dict[str, Any] = {
 }
 
 
-def _download_remote_file(url: str, dest_path: str) -> bool:
+def _download_remote_file(url: str, dest_path: str) -> str:
+    """下载并校验远程 JSON，返回 updated / skipped / failed。
+
+    与前后端更新逻辑一致：获取远程内容后计算 SHA-256，并与本地文件
+    SHA-256 对比；哈希一致则跳过写入，不生成额外的哈希缓存文件。
+    """
     tmp_path = f"{dest_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+    local_hash = _sha256_file(Path(dest_path))
     for cand_url in _remote_candidate_urls(url):
         try:
             req = urllib.request.Request(
                 cand_url,
-                headers={"User-Agent": f"{APP_NAME}/1.0", "Accept": "application/json"}
+                headers={
+                    "User-Agent": f"{APP_NAME}/1.0",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                },
             )
             ctx_ssl = SSL_CTX  # 复用全局免校验上下文，避免重复加载 CA 证书库
             with urllib.request.urlopen(req, timeout=10, context=ctx_ssl) as resp:
                 data = resp.read()
+                # 写入前先校验 JSON 格式，再计算远程内容 SHA-256。
                 json.loads(data.decode("utf-8-sig"))
+                remote_hash = _sha256_bytes(data)
+
+                if local_hash == remote_hash:
+                    info(
+                        f"[远程下载] 哈希一致，跳过写入 {Path(dest_path).name} "
+                        f"sha256={remote_hash[:12]}"
+                    )
+                    return "skipped"
+
                 with open(tmp_path, "wb") as f:
                     f.write(data)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
                 os.replace(tmp_path, dest_path)
                 if cand_url != url:
                     info(f"[远程下载] 经代理成功 {cand_url}")
-                return True
+                info(
+                    f"[远程下载] 内容已更新 {Path(dest_path).name} "
+                    f"{local_hash[:12] if local_hash else 'none'} -> {remote_hash[:12]}"
+                )
+                return "updated"
         except Exception as exc:
             warn(f"[远程下载] 下载失败 {cand_url} -> {dest_path}: {exc}")
             continue
@@ -1709,30 +1738,32 @@ def _download_remote_file(url: str, dest_path: str) -> bool:
             os.remove(tmp_path)
     except OSError:
         pass
-    return False
+    return "failed"
 
 
 def remote_download_worker():
     while True:
         try:
-            ok_db = _download_remote_file(REMOTE_CHINESE_DB_URL, LOCAL_CHINESE_DB_FILE)
+            db_result = _download_remote_file(REMOTE_CHINESE_DB_URL, LOCAL_CHINESE_DB_FILE)
             with _download_status_lock:
                 st = _download_status
-                if ok_db:
+                if db_result != "failed":
                     st["chinese_db_last_success"] = time.time()
                     st["chinese_db_last_error"] = ""
-                    info("[远程下载] ✅ 标题映射已更新")
+                    if db_result == "updated":
+                        info("[远程下载] ✅ 标题映射已更新")
                 else:
                     st["chinese_db_last_error"] = "下载失败"
 
-            ok_srv = _download_remote_file(REMOTE_SERVERS_URL, LOCAL_SERVERS_FILE)
+            srv_result = _download_remote_file(REMOTE_SERVERS_URL, LOCAL_SERVERS_FILE)
             with _download_status_lock:
                 st = _download_status
-                if ok_srv:
+                if srv_result != "failed":
                     st["servers_last_success"] = time.time()
                     st["servers_last_error"] = ""
                     st["remote_servers_available"] = True
-                    info("[远程下载] ✅ 服务器列表已更新")
+                    if srv_result == "updated":
+                        info("[远程下载] ✅ 服务器列表已更新")
                 else:
                     st["servers_last_error"] = "下载失败"
                     if not Path(LOCAL_SERVERS_FILE).is_file():
@@ -1858,20 +1889,30 @@ def do_update_backend() -> dict[str, Any]:
 def start_remote_download_thread():
     def _first_then_loop():
         try:
-            ok_db = _download_remote_file(REMOTE_CHINESE_DB_URL, LOCAL_CHINESE_DB_FILE)
+            db_result = _download_remote_file(REMOTE_CHINESE_DB_URL, LOCAL_CHINESE_DB_FILE)
             with _download_status_lock:
-                if ok_db:
+                if db_result != "failed":
                     _download_status["chinese_db_last_success"] = time.time()
-                    info("[远程下载] ✅ 首次标题映射下载成功")
+                    _download_status["chinese_db_last_error"] = ""
+                    info(
+                        "[远程下载] ✅ 首次标题映射下载成功"
+                        if db_result == "updated"
+                        else "[远程下载] ✅ 首次标题映射哈希一致，已跳过下载"
+                    )
                 else:
                     _download_status["chinese_db_last_error"] = "首次下载失败"
 
-            ok_srv = _download_remote_file(REMOTE_SERVERS_URL, LOCAL_SERVERS_FILE)
+            srv_result = _download_remote_file(REMOTE_SERVERS_URL, LOCAL_SERVERS_FILE)
             with _download_status_lock:
-                if ok_srv:
+                if srv_result != "failed":
                     _download_status["servers_last_success"] = time.time()
+                    _download_status["servers_last_error"] = ""
                     _download_status["remote_servers_available"] = True
-                    info("[远程下载] ✅ 首次服务器列表下载成功")
+                    info(
+                        "[远程下载] ✅ 首次服务器列表下载成功"
+                        if srv_result == "updated"
+                        else "[远程下载] ✅ 首次服务器列表哈希一致，已跳过下载"
+                    )
                 else:
                     _download_status["servers_last_error"] = "首次下载失败"
                     if not Path(LOCAL_SERVERS_FILE).is_file():
