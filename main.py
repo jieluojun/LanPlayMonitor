@@ -1435,10 +1435,11 @@ def save_env_config(data: dict[str, Any]) -> dict[str, Any]:
 
 
 # ============================================================================
-# SECTION 3.7 · 环境变量配置安全（公网强制密码 + 局域网跳过）
+# SECTION 3.7 · 环境变量配置安全（公网强制密码 + 局域网始终跳过）
 # 安全密码以明文保存在 env.json 的 security.password；也可通过 OS 环境变量
-# SECURITY_PASSWORD 注入（OS 优先于文件）。一旦设置，之后无论局域网/公网
-# 修改配置都需输入正确密码。
+# SECURITY_PASSWORD 注入（OS 优先于文件）。
+# 策略：局域网/本机访问一律忽略安全密码（无论是否已设置）；
+#       公网未设密码强制先设；公网已设密码必须校验。
 # ============================================================================
 
 # 注意：不再使用独立的 SECURITY_FILE 常量；不再使用加盐哈希三字段
@@ -3400,11 +3401,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     pw_ok = bool(provided_pw) and verify_password(provided_pw)
 
                     # 完整 /api/env（含全部密钥）访问策略：
-                    # - 已设密码：必须提供正确密码
+                    # - 局域网/本机：一律放行，忽略是否已设安全密码
+                    # - 公网且已设密码：必须提供正确密码
                     # - 公网且未设密码：拒绝，要求先设密码
-                    # - 局域网且未设密码：允许（与设置页「局域网跳过」一致）
                     allow_full = False
-                    if password_set:
+                    if not is_public:
+                        allow_full = True
+                    elif password_set:
                         if not pw_ok:
                             data = {
                                 "ok": False,
@@ -3418,7 +3421,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                             self._send(body, headers, status)
                             return
                         allow_full = True
-                    elif is_public:
+                    else:
                         data = {
                             "ok": False,
                             "error": "公网访问请先设置安全密码后再查看环境变量配置",
@@ -3431,8 +3434,6 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
                         self._send(body, headers, status)
                         return
-                    else:
-                        allow_full = True
 
                     # 下发前把 security 规整为单一明文 password + source
                     # （OS SECURITY_PASSWORD 优先；不暴露旧版 hash 字段）
@@ -3467,10 +3468,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 try:
                     is_public, client_ip = is_public_request(self)
                     sec = load_security()
+                    pw_set = bool(sec.get("password"))
                     data = {
                         "ok": True,
                         "is_public": is_public,
-                        "password_set": bool(sec.get("password")),
+                        "password_set": pw_set,
+                        # 仅公网需要门禁；局域网始终不要求密码
+                        "password_required": bool(is_public and pw_set),
+                        "need_set_password": bool(is_public and not pw_set),
                         "password_source": str(sec.get("source", "") or ""),
                         "client_ip": client_ip,
                     }
@@ -4043,8 +4048,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/env/set-password":
                 try:
-                    # 若已设置密码，则需先用旧密码验证才能修改
-                    if is_password_set():
+                    is_public, _client_ip = is_public_request(self)
+                    # 公网且已设密码时需旧密码；局域网一律跳过旧密码校验
+                    if is_public and is_password_set():
                         old_pw = str(req_json.get("old_password", ""))
                         if not verify_password(old_pw):
                             raise PermissionError("需要正确的旧密码才能修改安全密码")
@@ -4069,8 +4075,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             if path == "/api/env/verify-password":
                 try:
-                    ok = verify_password(req_json.get("password", ""))
-                    data = {"ok": True, "verified": ok}
+                    is_public, _client_ip = is_public_request(self)
+                    # 局域网忽略安全密码：恒为通过
+                    if not is_public:
+                        ok = True
+                    else:
+                        ok = verify_password(req_json.get("password", ""))
+                    data = {"ok": True, "verified": ok, "is_public": is_public}
                     body, headers, status = make_json_response(data)
                 except Exception as e:
                     err(f"[API] /api/env/verify-password 异常: {e}")
@@ -4087,7 +4098,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         raise ValueError("请求体必须是 JSON 对象")
                     auth_pw = str(req_json.pop("password", "") or "")
                     req_json.pop("old_password", None)
-                    if is_password_set():
+                    is_public, _client_ip = is_public_request(self)
+                    # 局域网忽略安全密码；仅公网且已设密码时校验
+                    if is_public and is_password_set():
                         if not verify_password(auth_pw):
                             raise PermissionError("需要正确的安全密码才能修改环境变量配置")
 

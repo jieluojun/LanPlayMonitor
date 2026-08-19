@@ -14116,9 +14116,10 @@ html:not(.dark) {
       }
     }
 
-    // ===== 环境变量安全：公网强制密码 / 局域网跳过 =====
+    // ===== 环境变量安全：公网强制密码 / 局域网始终跳过 =====
     // 安全密码为单一明文（env.json security.password 或 OS SECURITY_PASSWORD）。
-    // 一旦设置过安全密码，之后无论局域网/公网都需输入密码才能修改。
+    // 局域网/本机：无论是否已设密码，一律跳过门禁；
+    // 公网未设：强制设置；公网已设：输入密码后才能查看/修改。
     let _envVerifiedPassword = ""; // 本次会话已通过验证的密码（用于鉴权保存/读取）
     let _envPasswordSource = ""; // "env" | "file" | "" — 当前生效来源
 
@@ -14287,6 +14288,8 @@ html:not(.dark) {
             _envSecurityCache = {
               is_public: !!st.is_public,
               password_set: !!st.password_set,
+              password_required: !!st.password_required,
+              need_set_password: !!st.need_set_password,
               password_source: st.password_source || "",
               at: Date.now(),
             };
@@ -14307,15 +14310,17 @@ html:not(.dark) {
 
     function _decideEnvSecurityGate(st, onOpen) {
       st = st || {};
-      if (st.password_set) {
-        // 已配置密码 → 输入密码才能修改
+      // 局域网 / localhost：始终跳过安全密码（不论是否已设置）
+      if (!st.is_public) {
+        onOpen();
+        return;
+      }
+      if (st.password_set || st.password_required) {
+        // 公网且已配置密码 → 输入密码才能修改
         requirePasswordToOpen(onOpen);
-      } else if (st.is_public) {
+      } else {
         // 公网且未设密码 → 强制设置安全密码（二次确认）
         forceSetPassword(onOpen);
-      } else {
-        // 局域网 / localhost → 跳过安全检测，直接打开
-        onOpen();
       }
     }
 
