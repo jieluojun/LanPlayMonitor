@@ -28,7 +28,7 @@
     "name": "jaysea2",
     "host": "switch.jayseateam.nl",
     "port": 11453,
-    "type": "graphql",
+    "type": "rest",
     "region": "🇳🇱 荷兰 北荷兰"
   },
   {
@@ -44,9 +44,9 @@
     "name": "muitxobem",
     "host": "muitxobem-lanplay.ddns.net",
     "port": 11451,
-    "type": "graphql",
+    "type": "rest",
     "region": "🇺🇸 美国"
-  },   
+  },
   {
     "id": "7",
     "name": "lp1",
@@ -68,7 +68,7 @@
     "name": "olunira",
     "host": "olunira.fun",
     "port": 11451,
-    "type": "graphql",
+    "type": "rest",
     "region": "🇨🇳 中国 北京"
   },
   {
@@ -84,7 +84,7 @@
     "name": "r3ps4j",
     "host": "switch.r3ps4j.nl",
     "port": 11452,
-    "type": "graphql",
+    "type": "rest",
     "region": "🇨🇳 丹麦 首都 哥本哈根"
   },
   {
